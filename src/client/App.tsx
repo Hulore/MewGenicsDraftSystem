@@ -12,7 +12,8 @@ import {
   Swords,
   Unlock,
   User,
-  Users
+  Users,
+  X
 } from "lucide-react";
 import { createLobby, fetchLobbies, joinLobby } from "./api";
 import { clearStoredSession, getStoredSession, storeSession } from "./session";
@@ -412,7 +413,8 @@ function ConnectedLobbyRoom({
       {state?.status === "waiting" && <WaitingLobby state={state} send={send} />}
       {state?.status === "rolling" && <RollStage state={state} send={send} />}
       {state?.status === "drafting" && <DraftStage state={state} send={send} />}
-      {state?.status === "complete" && <ResultsStage state={state} />}
+      {state?.status === "complete" && <ResultsStage state={state} send={send} />}
+      {state?.status === "closed" && <ClosedLobby state={state} onLeave={onLeave} />}
     </main>
   );
 }
@@ -675,6 +677,8 @@ function RollStage({
     Boolean(state.viewerParticipantId) &&
     state.players.some((player) => player.id === state.viewerParticipantId) &&
     viewerRoll === undefined;
+  const latestAttempt = roll.history[roll.history.length - 1];
+  const waitingForFinalRound = Boolean(latestAttempt?.winnerId && !latestAttempt.tied);
 
   return (
     <div className="roll-layout">
@@ -711,6 +715,12 @@ function RollStage({
           </button>
         )}
 
+        {waitingForFinalRound && (
+          <div className="notice is-info">
+            Кубики упали. Последний раунд начнется через мгновение.
+          </div>
+        )}
+
         {roll.history.length > 0 && (
           <div className="roll-history">
             {roll.history.map((attempt) => (
@@ -730,7 +740,15 @@ function RollStage({
   );
 }
 
-function ResultsStage({ state }: { state: PublicLobbyState }) {
+function ResultsStage({
+  state,
+  send
+}: {
+  state: PublicLobbyState;
+  send: (message: ClientMessage) => void;
+}) {
+  const viewerIsHost = state.viewerParticipantId === state.hostParticipantId;
+
   return (
     <div className="results-layout">
       <section className="panel results-panel">
@@ -742,6 +760,43 @@ function ResultsStage({ state }: { state: PublicLobbyState }) {
           <Swords size={24} />
         </div>
         <PlayerPools state={state} expanded />
+        {viewerIsHost && (
+          <div className="results-actions">
+            <button className="danger-button" onClick={() => send({ type: "closeLobby" })}>
+              <X size={18} />
+              Закрыть лобби
+            </button>
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function ClosedLobby({
+  state,
+  onLeave
+}: {
+  state: PublicLobbyState;
+  onLeave: () => void;
+}) {
+  const host = state.participants.find((participant) => participant.id === state.hostParticipantId);
+
+  return (
+    <div className="results-layout">
+      <section className="panel closed-panel">
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Lobby closed</p>
+            <h2>{state.id}</h2>
+          </div>
+          <X size={24} />
+        </div>
+        <p>{host?.name ?? "Создатель"} закрыл лобби после завершения драфта.</p>
+        <button className="primary-button" onClick={onLeave}>
+          <ChevronLeft size={18} />
+          К списку лобби
+        </button>
       </section>
     </div>
   );
@@ -850,6 +905,7 @@ function statusLabel(status: PublicLobbyState["status"] | LobbySummary["status"]
   if (status === "waiting") return "Ожидание";
   if (status === "rolling") return "Кубик";
   if (status === "drafting") return "Драфт";
+  if (status === "closed") return "Закрыто";
   return "Итог";
 }
 

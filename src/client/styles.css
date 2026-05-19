@@ -339,6 +339,12 @@ input:focus {
   color: #ffb5af;
 }
 
+.notice.is-info {
+  border: 1px solid rgba(59, 169, 156, 0.46);
+  background: rgba(59, 169, 156, 0.12);
+  color: #9cf1e6;
+}
+
 .notice button {
   margin-left: 12px;
   color: var(--paper-strong);
@@ -371,6 +377,23 @@ input:focus {
 .primary-button:disabled {
   cursor: not-allowed;
   opacity: 0.45;
+}
+
+.danger-button {
+  min-height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  border-radius: 8px;
+  background: rgba(255, 107, 95, 0.14);
+  color: #ffc4bf;
+  cursor: pointer;
+  font-weight: 900;
+}
+
+.danger-button:hover {
+  background: rgba(255, 107, 95, 0.24);
 }
 
 .search-field {
@@ -713,8 +736,25 @@ input:focus {
 }
 
 .roll-panel,
-.results-panel {
+.results-panel,
+.closed-panel {
   width: min(860px, 100%);
+}
+
+.closed-panel {
+  padding: 20px;
+}
+
+.closed-panel p {
+  margin: 0 0 16px;
+  color: var(--muted);
+  font-weight: 800;
+}
+
+.results-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
 }
 
 .dice-grid {
@@ -879,4 +919,3 @@ input:focus {
     scroll-behavior: auto !important;
   }
 }
-

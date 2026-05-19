@@ -50,6 +50,7 @@ interface InternalLobby {
 
 const LOBBY_STORAGE_KEY = "lobby";
 const REGISTRY_PREFIX = "lobby:";
+const ROLL_REVEAL_DELAY_MS = 2200;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -89,7 +90,9 @@ export class LobbyRegistry {
 
     if (url.pathname === "/list" && request.method === "GET") {
       const entries = await this.state.storage.list<LobbySummary>({ prefix: REGISTRY_PREFIX });
-      const lobbies = [...entries.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+      const lobbies = [...entries.values()]
+        .filter((lobby) => lobby.status !== "closed")
+        .sort((a, b) => b.updatedAt - a.updatedAt);
       return json({ lobbies });
     }
 
@@ -123,6 +126,12 @@ export class LobbyRegistry {
     if (url.pathname === "/upsert" && request.method === "POST") {
       const summary = await readJson<LobbySummary>(request);
       await this.state.storage.put(`${REGISTRY_PREFIX}${summary.id}`, summary);
+      return json({ ok: true });
+    }
+
+    if (url.pathname === "/remove" && request.method === "POST") {
+      const body = await readJson<{ id: string }>(request);
+      await this.state.storage.delete(`${REGISTRY_PREFIX}${body.id}`);
       return json({ ok: true });
     }
 
@@ -173,6 +182,22 @@ export class DraftLobby {
     }
 
     return json({ error: "Not found" }, 404);
+  }
+
+  async alarm(): Promise<void> {
+    const lobby = await this.loadLobby();
+    const lastRoll = lobby?.roll?.history.at(-1);
+
+    if (!lobby || lobby.status !== "rolling" || !lobby.roll || !lastRoll?.winnerId || lastRoll.tied) {
+      return;
+    }
+
+    this.prepareRound(lobby, lobby.roll.roundIndex, lastRoll.winnerId);
+    lobby.updatedAt = Date.now();
+
+    await this.persist();
+    await this.syncSummary();
+    this.broadcast(lobby);
   }
 
   private async init(request: Request): Promise<Response> {
@@ -370,6 +395,8 @@ export class DraftLobby {
         await this.chooseClass(lobby, sessionId, message.classId);
       } else if (message.type === "rollDie") {
         await this.rollDie(lobby, sessionId);
+      } else if (message.type === "closeLobby") {
+        await this.closeLobby(lobby, sessionId);
       }
     } catch (error) {
       this.send(socket, {
@@ -550,15 +577,35 @@ export class DraftLobby {
         lobby.roll.currentRolls = {};
         lobby.roll.attempt += 1;
       } else if (winnerId) {
-        const roundIndex = lobby.roll.roundIndex;
         lobby.lastRoundChooserId = winnerId;
-        this.prepareRound(lobby, roundIndex, winnerId);
+        await this.state.storage.setAlarm(Date.now() + ROLL_REVEAL_DELAY_MS);
       }
     }
 
     lobby.updatedAt = Date.now();
     await this.persist();
     await this.syncSummary();
+    this.broadcast(lobby);
+  }
+
+  private async closeLobby(lobby: InternalLobby, sessionId: string): Promise<void> {
+    const participant = this.getParticipantBySession(lobby, sessionId);
+
+    if (!participant?.isHost) {
+      throw new Error("Закрыть лобби может только создатель.");
+    }
+
+    if (lobby.status !== "complete") {
+      throw new Error("Лобби можно закрыть только после завершения драфта.");
+    }
+
+    lobby.status = "closed";
+    lobby.currentRound = null;
+    lobby.roll = null;
+    lobby.updatedAt = Date.now();
+
+    await this.persist();
+    await this.removeSummary();
     this.broadcast(lobby);
   }
 
@@ -679,12 +726,34 @@ export class DraftLobby {
       return;
     }
 
+    if (this.lobby.status === "closed") {
+      await this.removeSummary();
+      return;
+    }
+
     const registry = this.env.LOBBY_REGISTRY.get(this.env.LOBBY_REGISTRY.idFromName("global"));
     try {
       await registry.fetch("https://registry/upsert", {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify(toSummary(this.toPublicState(this.lobby, "")))
+      });
+    } catch {
+      // Registry sync is best-effort; the lobby itself remains authoritative.
+    }
+  }
+
+  private async removeSummary(): Promise<void> {
+    if (!this.lobby) {
+      return;
+    }
+
+    const registry = this.env.LOBBY_REGISTRY.get(this.env.LOBBY_REGISTRY.idFromName("global"));
+    try {
+      await registry.fetch("https://registry/remove", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: this.lobby.id })
       });
     } catch {
       // Registry sync is best-effort; the lobby itself remains authoritative.

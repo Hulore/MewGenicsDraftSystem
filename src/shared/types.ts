@@ -2,7 +2,7 @@ import type { ClassId } from "./classes";
 
 export type CreatorRole = "manager" | "player";
 export type ParticipantRole = "manager" | "player";
-export type LobbyStatus = "waiting" | "rolling" | "drafting" | "complete";
+export type LobbyStatus = "waiting" | "rolling" | "drafting" | "complete" | "closed";
 
 export interface ClassCounts {
   [classId: string]: number;
@@ -122,7 +122,8 @@ export interface JoinLobbyResponse {
 export type ClientMessage =
   | { type: "startDraft" }
   | { type: "chooseClass"; classId: ClassId }
-  | { type: "rollDie" };
+  | { type: "rollDie" }
+  | { type: "closeLobby" };
 
 export type ServerMessage =
   | { type: "state"; state: PublicLobbyState }
