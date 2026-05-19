@@ -26,6 +26,7 @@ interface Env {
   ASSETS: Fetcher;
   DRAFT_LOBBY: DurableObjectNamespace;
   LOBBY_REGISTRY: DurableObjectNamespace;
+  ADMIN_TOKEN?: string;
 }
 
 interface InternalLobby {
@@ -55,6 +56,39 @@ const ROLL_REVEAL_DELAY_MS = 2200;
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
+
+    if (url.pathname === "/api/admin/lobbies" && request.method === "GET") {
+      if (!isAuthorizedAdmin(request, env)) {
+        return json({ error: "Not found" }, 404);
+      }
+
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      return registry.fetch(new Request("https://registry/list", request));
+    }
+
+    if (url.pathname === "/api/admin/lobbies/close-all" && request.method === "POST") {
+      if (!isAuthorizedAdmin(request, env)) {
+        return json({ error: "Not found" }, 404);
+      }
+
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      return registry.fetch("https://registry/admin-close-all", { method: "POST" });
+    }
+
+    const adminCloseRoute = url.pathname.match(/^\/api\/admin\/lobbies\/([A-Z0-9]{6})\/close$/);
+    if (adminCloseRoute && request.method === "POST") {
+      if (!isAuthorizedAdmin(request, env)) {
+        return json({ error: "Not found" }, 404);
+      }
+
+      const [, lobbyId] = adminCloseRoute;
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      return registry.fetch("https://registry/admin-close", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ id: lobbyId })
+      });
+    }
 
     if (url.pathname === "/api/lobbies" && request.method === "GET") {
       const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
@@ -135,7 +169,37 @@ export class LobbyRegistry {
       return json({ ok: true });
     }
 
+    if (url.pathname === "/admin-close" && request.method === "POST") {
+      const body = await readJson<{ id: string }>(request);
+      const closed = await this.closeLobbyById(body.id);
+      return json({ closed });
+    }
+
+    if (url.pathname === "/admin-close-all" && request.method === "POST") {
+      const entries = await this.state.storage.list<LobbySummary>({ prefix: REGISTRY_PREFIX });
+      const ids = [...entries.values()].map((lobby) => lobby.id);
+      const closed = [];
+
+      for (const id of ids) {
+        closed.push(...(await this.closeLobbyById(id)));
+      }
+
+      return json({ closed });
+    }
+
     return json({ error: "Not found" }, 404);
+  }
+
+  private async closeLobbyById(id: string): Promise<string[]> {
+    const summary = await this.state.storage.get<LobbySummary>(`${REGISTRY_PREFIX}${id}`);
+    if (!summary) {
+      return [];
+    }
+
+    const lobby = this.env.DRAFT_LOBBY.get(this.env.DRAFT_LOBBY.idFromName(id));
+    await lobby.fetch("https://lobby/admin-close", { method: "POST" });
+    await this.state.storage.delete(`${REGISTRY_PREFIX}${id}`);
+    return [id];
   }
 
   private async createLobbyId(): Promise<string> {
@@ -179,6 +243,10 @@ export class DraftLobby {
 
     if (url.pathname === "/ws" && request.headers.get("upgrade") === "websocket") {
       return this.openSocket(request);
+    }
+
+    if (url.pathname === "/admin-close" && request.method === "POST") {
+      return this.adminClose();
     }
 
     return json({ error: "Not found" }, 404);
@@ -609,6 +677,23 @@ export class DraftLobby {
     this.broadcast(lobby);
   }
 
+  private async adminClose(): Promise<Response> {
+    const lobby = await this.loadLobby();
+    if (!lobby) {
+      return json({ ok: true });
+    }
+
+    lobby.status = "closed";
+    lobby.currentRound = null;
+    lobby.roll = null;
+    lobby.updatedAt = Date.now();
+
+    await this.persist();
+    this.broadcast(lobby);
+
+    return json({ ok: true });
+  }
+
   private enterRollStage(lobby: InternalLobby, roundIndex: number): void {
     lobby.status = "rolling";
     lobby.currentRound = null;
@@ -803,6 +888,18 @@ function toSummary(state: PublicLobbyState): LobbySummary {
     createdAt: state.createdAt,
     updatedAt: state.updatedAt
   };
+}
+
+function isAuthorizedAdmin(request: Request, env: Env): boolean {
+  const expectedToken = env.ADMIN_TOKEN?.trim();
+  if (!expectedToken) {
+    return false;
+  }
+
+  const authHeader = request.headers.get("authorization") ?? "";
+  const bearerToken = authHeader.startsWith("Bearer ") ? authHeader.slice("Bearer ".length) : "";
+  const headerToken = request.headers.get("x-admin-token") ?? "";
+  return bearerToken === expectedToken || headerToken === expectedToken;
 }
 
 async function readJson<T>(request: Request): Promise<T> {

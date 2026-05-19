@@ -8,7 +8,10 @@
     "dev": "npm run build:client && wrangler dev --local",
     "build:client": "vite build",
     "deploy": "npm run build && wrangler deploy",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "admin:lobbies": "node scripts/admin-lobbies.mjs list",
+    "admin:close": "node scripts/admin-lobbies.mjs close",
+    "admin:close-all": "node scripts/admin-lobbies.mjs close-all"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",
