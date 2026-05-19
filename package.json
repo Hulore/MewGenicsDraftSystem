@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit",
     "admin:lobbies": "node scripts/admin-lobbies.mjs list",
     "admin:close": "node scripts/admin-lobbies.mjs close",
-    "admin:close-all": "node scripts/admin-lobbies.mjs close-all"
+    "admin:close-all": "node scripts/admin-lobbies.mjs close-all",
+    "admin:build-exe": "dotnet publish tools/MewgenicsLobbyAdmin/MewgenicsLobbyAdmin.csproj -c Release -r win-x64 --self-contained false -p:PublishSingleFile=true -o local-admin"
   },
   "dependencies": {
     "lucide-react": "^0.468.0",

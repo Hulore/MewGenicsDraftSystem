@@ -4,3 +4,6 @@ dist
 .dev.vars
 .admin.local.json
 *.local
+tools/**/bin
+tools/**/obj
+local-admin
