@@ -43,9 +43,24 @@ public sealed class LobbyAdminForm : Form
         _httpClient.BaseAddress = new Uri(_config.ApiBase);
         _httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", _config.AdminToken);
 
-        Controls.Add(BuildHeader());
-        Controls.Add(BuildGrid());
-        Controls.Add(BuildFooter());
+        var layout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 3,
+            BackColor = BackColor,
+            Margin = Padding.Empty,
+            Padding = Padding.Empty
+        };
+        layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 78F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Percent, 100F));
+        layout.RowStyles.Add(new RowStyle(SizeType.Absolute, 44F));
+
+        layout.Controls.Add(BuildHeader(), 0, 0);
+        layout.Controls.Add(BuildGrid(), 0, 1);
+        layout.Controls.Add(BuildFooter(), 0, 2);
+        Controls.Add(layout);
 
         _refreshTimer.Interval = 7000;
         _refreshTimer.Tick += async (_, _) => await RefreshLobbiesAsync();
@@ -58,7 +73,7 @@ public sealed class LobbyAdminForm : Form
     {
         var header = new Panel
         {
-            Dock = DockStyle.Top,
+            Dock = DockStyle.Fill,
             Height = 78,
             Padding = new Padding(18, 14, 18, 10),
             BackColor = Color.FromArgb(32, 25, 18)
@@ -182,7 +197,7 @@ public sealed class LobbyAdminForm : Form
     {
         var footer = new Panel
         {
-            Dock = DockStyle.Bottom,
+            Dock = DockStyle.Fill,
             Height = 44,
             Padding = new Padding(18, 8, 18, 8),
             BackColor = Color.FromArgb(32, 25, 18)
