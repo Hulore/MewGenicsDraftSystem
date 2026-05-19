@@ -44,14 +44,17 @@ interface InternalLobby {
   completedRounds: PublicLobbyState["completedRounds"];
   currentRound: PublicLobbyState["currentRound"];
   roll: RollState | null;
+  rollRevealAt: number | null;
   lastRoundChooserId: string | null;
   createdAt: number;
   updatedAt: number;
+  autoCloseAt: number;
 }
 
 const LOBBY_STORAGE_KEY = "lobby";
 const REGISTRY_PREFIX = "lobby:";
 const ROLL_REVEAL_DELAY_MS = 2200;
+const LOBBY_IDLE_AUTO_CLOSE_MS = 15 * 60 * 1000;
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -123,11 +126,7 @@ export class LobbyRegistry {
     const url = new URL(request.url);
 
     if (url.pathname === "/list" && request.method === "GET") {
-      const entries = await this.state.storage.list<LobbySummary>({ prefix: REGISTRY_PREFIX });
-      const lobbies = [...entries.values()]
-        .filter((lobby) => lobby.status !== "closed")
-        .sort((a, b) => b.updatedAt - a.updatedAt);
-      return json({ lobbies });
+      return json({ lobbies: await this.listVisibleLobbies() });
     }
 
     if (url.pathname === "/create" && request.method === "POST") {
@@ -202,6 +201,28 @@ export class LobbyRegistry {
     return [id];
   }
 
+  private async listVisibleLobbies(): Promise<LobbySummary[]> {
+    const entries = await this.state.storage.list<LobbySummary>({ prefix: REGISTRY_PREFIX });
+    const now = Date.now();
+    const lobbies: LobbySummary[] = [];
+
+    for (const summary of entries.values()) {
+      if (summary.status === "closed") {
+        await this.state.storage.delete(`${REGISTRY_PREFIX}${summary.id}`);
+        continue;
+      }
+
+      if (getSummaryAutoCloseAt(summary) <= now) {
+        await this.closeLobbyById(summary.id);
+        continue;
+      }
+
+      lobbies.push(summary);
+    }
+
+    return lobbies.sort((a, b) => b.updatedAt - a.updatedAt);
+  }
+
   private async createLobbyId(): Promise<string> {
     for (let attempt = 0; attempt < 30; attempt += 1) {
       const id = randomLobbyId();
@@ -254,18 +275,40 @@ export class DraftLobby {
 
   async alarm(): Promise<void> {
     const lobby = await this.loadLobby();
-    const lastRoll = lobby?.roll?.history.at(-1);
 
-    if (!lobby || lobby.status !== "rolling" || !lobby.roll || !lastRoll?.winnerId || lastRoll.tied) {
+    if (!lobby) {
       return;
     }
 
-    this.prepareRound(lobby, lobby.roll.roundIndex, lastRoll.winnerId);
-    lobby.updatedAt = Date.now();
+    const now = Date.now();
+    if (lobby.status !== "closed" && lobby.autoCloseAt <= now) {
+      await this.autoCloseLobby(lobby, now);
+      return;
+    }
+
+    const lastRoll = lobby.roll?.history.at(-1);
+    if (
+      lobby.status === "rolling" &&
+      lobby.roll &&
+      lobby.rollRevealAt &&
+      lobby.rollRevealAt <= now &&
+      lastRoll?.winnerId &&
+      !lastRoll.tied
+    ) {
+      this.prepareRound(lobby, lobby.roll.roundIndex, lastRoll.winnerId);
+      this.touchLobby(lobby, now);
+
+      await this.persist();
+      await this.syncSummary();
+      this.broadcast(lobby);
+      return;
+    }
+
+    if (lobby.rollRevealAt && lobby.rollRevealAt <= now) {
+      lobby.rollRevealAt = null;
+    }
 
     await this.persist();
-    await this.syncSummary();
-    this.broadcast(lobby);
   }
 
   private async init(request: Request): Promise<Response> {
@@ -333,9 +376,11 @@ export class DraftLobby {
       completedRounds: [],
       currentRound: null,
       roll: null,
+      rollRevealAt: null,
       lastRoundChooserId: null,
       createdAt: now,
-      updatedAt: now
+      updatedAt: now,
+      autoCloseAt: now + LOBBY_IDLE_AUTO_CLOSE_MS
     };
 
     this.lobby = lobby;
@@ -386,7 +431,7 @@ export class DraftLobby {
     lobby.sessionIndex[sessionId] = participantId;
     lobby.playerOrder.push(participantId);
     lobby.playerPools[participantId] = [];
-    lobby.updatedAt = now;
+    this.touchLobby(lobby, now);
 
     await this.persist();
     await this.syncSummary();
@@ -413,7 +458,7 @@ export class DraftLobby {
 
     participant.connected = true;
     participant.lastSeenAt = Date.now();
-    lobby.updatedAt = participant.lastSeenAt;
+    this.touchLobby(lobby, participant.lastSeenAt);
     await this.persist();
     await this.syncSummary();
 
@@ -495,7 +540,7 @@ export class DraftLobby {
     if (!this.hasActiveSocketForParticipant(lobby, participant.id)) {
       participant.connected = false;
       participant.lastSeenAt = Date.now();
-      lobby.updatedAt = participant.lastSeenAt;
+      this.touchLobby(lobby, participant.lastSeenAt);
       await this.persist();
       await this.syncSummary();
       this.broadcast(lobby);
@@ -532,6 +577,7 @@ export class DraftLobby {
       this.prepareRound(lobby, 0);
     }
 
+    this.touchLobby(lobby);
     await this.persist();
     await this.syncSummary();
     this.broadcast(lobby);
@@ -602,7 +648,7 @@ export class DraftLobby {
       this.prepareRound(lobby, completedCount);
     }
 
-    lobby.updatedAt = Date.now();
+    this.touchLobby(lobby);
     await this.persist();
     await this.syncSummary();
     this.broadcast(lobby);
@@ -646,11 +692,11 @@ export class DraftLobby {
         lobby.roll.attempt += 1;
       } else if (winnerId) {
         lobby.lastRoundChooserId = winnerId;
-        await this.state.storage.setAlarm(Date.now() + ROLL_REVEAL_DELAY_MS);
+        lobby.rollRevealAt = Date.now() + ROLL_REVEAL_DELAY_MS;
       }
     }
 
-    lobby.updatedAt = Date.now();
+    this.touchLobby(lobby);
     await this.persist();
     await this.syncSummary();
     this.broadcast(lobby);
@@ -667,10 +713,7 @@ export class DraftLobby {
       throw new Error("Лобби можно закрыть только после завершения драфта.");
     }
 
-    lobby.status = "closed";
-    lobby.currentRound = null;
-    lobby.roll = null;
-    lobby.updatedAt = Date.now();
+    this.markLobbyClosed(lobby);
 
     await this.persist();
     await this.removeSummary();
@@ -683,10 +726,7 @@ export class DraftLobby {
       return json({ ok: true });
     }
 
-    lobby.status = "closed";
-    lobby.currentRound = null;
-    lobby.roll = null;
-    lobby.updatedAt = Date.now();
+    this.markLobbyClosed(lobby);
 
     await this.persist();
     this.broadcast(lobby);
@@ -697,6 +737,7 @@ export class DraftLobby {
   private enterRollStage(lobby: InternalLobby, roundIndex: number): void {
     lobby.status = "rolling";
     lobby.currentRound = null;
+    lobby.rollRevealAt = null;
     lobby.roll = {
       roundIndex,
       attempt: 1,
@@ -719,6 +760,7 @@ export class DraftLobby {
 
     lobby.status = "drafting";
     lobby.roll = null;
+    lobby.rollRevealAt = null;
     lobby.currentRound = {
       index: roundIndex,
       pair,
@@ -749,7 +791,8 @@ export class DraftLobby {
       roll: lobby.roll,
       lastRoundChooserId: lobby.lastRoundChooserId,
       createdAt: lobby.createdAt,
-      updatedAt: lobby.updatedAt
+      updatedAt: lobby.updatedAt,
+      autoCloseAt: lobby.autoCloseAt
     };
   }
 
@@ -782,9 +825,33 @@ export class DraftLobby {
     return false;
   }
 
+  private touchLobby(lobby: InternalLobby, now = Date.now()): void {
+    lobby.updatedAt = now;
+    lobby.autoCloseAt = now + LOBBY_IDLE_AUTO_CLOSE_MS;
+  }
+
+  private markLobbyClosed(lobby: InternalLobby, now = Date.now()): void {
+    lobby.status = "closed";
+    lobby.currentRound = null;
+    lobby.roll = null;
+    lobby.rollRevealAt = null;
+    lobby.updatedAt = now;
+    lobby.autoCloseAt = now;
+  }
+
+  private async autoCloseLobby(lobby: InternalLobby, now = Date.now()): Promise<void> {
+    this.markLobbyClosed(lobby, now);
+    await this.persist();
+    await this.removeSummary();
+    this.broadcast(lobby);
+  }
+
   private async loadLobby(): Promise<InternalLobby | null> {
     if (!this.lobby) {
       this.lobby = (await this.state.storage.get<InternalLobby>(LOBBY_STORAGE_KEY)) ?? null;
+      if (this.lobby && this.normalizeLobbyTimers(this.lobby)) {
+        await this.persist();
+      }
     }
 
     return this.lobby;
@@ -797,13 +864,49 @@ export class DraftLobby {
       throw new Error("Lobby does not exist.");
     }
 
+    if (lobby.status !== "closed" && lobby.autoCloseAt <= Date.now()) {
+      await this.autoCloseLobby(lobby);
+    }
+
     return lobby;
   }
 
   private async persist(): Promise<void> {
     if (this.lobby) {
       await this.state.storage.put(LOBBY_STORAGE_KEY, this.lobby);
+      await this.scheduleNextAlarm();
     }
+  }
+
+  private normalizeLobbyTimers(lobby: InternalLobby): boolean {
+    let changed = false;
+    const timerFields = lobby as Partial<InternalLobby>;
+
+    if (!Number.isFinite(timerFields.autoCloseAt)) {
+      lobby.autoCloseAt = (Number.isFinite(lobby.updatedAt) ? lobby.updatedAt : Date.now()) + LOBBY_IDLE_AUTO_CLOSE_MS;
+      changed = true;
+    }
+
+    if (timerFields.rollRevealAt === undefined) {
+      lobby.rollRevealAt = null;
+      changed = true;
+    }
+
+    return changed;
+  }
+
+  private async scheduleNextAlarm(): Promise<void> {
+    if (!this.lobby || this.lobby.status === "closed") {
+      await this.state.storage.deleteAlarm();
+      return;
+    }
+
+    const candidates = [this.lobby.autoCloseAt];
+    if (this.lobby.rollRevealAt) {
+      candidates.push(this.lobby.rollRevealAt);
+    }
+
+    await this.state.storage.setAlarm(Math.min(...candidates));
   }
 
   private async syncSummary(): Promise<void> {
@@ -886,8 +989,15 @@ function toSummary(state: PublicLobbyState): LobbySummary {
     rounds: state.settings.rounds,
     mirrorDraft: state.settings.mirrorDraft,
     createdAt: state.createdAt,
-    updatedAt: state.updatedAt
+    updatedAt: state.updatedAt,
+    autoCloseAt: state.autoCloseAt
   };
+}
+
+function getSummaryAutoCloseAt(summary: LobbySummary): number {
+  return Number.isFinite(summary.autoCloseAt)
+    ? summary.autoCloseAt
+    : summary.updatedAt + LOBBY_IDLE_AUTO_CLOSE_MS;
 }
 
 function isAuthorizedAdmin(request: Request, env: Env): boolean {

@@ -27,6 +27,7 @@ export interface LobbySummary {
   mirrorDraft: boolean;
   createdAt: number;
   updatedAt: number;
+  autoCloseAt: number;
 }
 
 export interface Participant {
@@ -91,6 +92,7 @@ export interface PublicLobbyState {
   lastRoundChooserId: string | null;
   createdAt: number;
   updatedAt: number;
+  autoCloseAt: number;
 }
 
 export interface CreateLobbyRequest {
