@@ -137,7 +137,7 @@ public sealed class LobbyAdminForm : Form
         _grid.RowTemplate.Height = 42;
         _grid.SelectionMode = DataGridViewSelectionMode.FullRowSelect;
         _grid.DataError += (_, _) => { };
-        _grid.CellContentClick += async (_, eventArgs) => await HandleGridClickAsync(eventArgs);
+        _grid.CellClick += async (_, eventArgs) => await HandleGridClickAsync(eventArgs);
 
         _grid.ColumnHeadersDefaultCellStyle.BackColor = Color.FromArgb(40, 32, 24);
         _grid.ColumnHeadersDefaultCellStyle.ForeColor = Color.FromArgb(214, 168, 61);
@@ -147,6 +147,26 @@ public sealed class LobbyAdminForm : Form
         _grid.DefaultCellStyle.SelectionBackColor = Color.FromArgb(58, 47, 36);
         _grid.DefaultCellStyle.SelectionForeColor = Color.White;
 
+        _grid.Columns.Add(new DataGridViewButtonColumn
+        {
+            Name = "close",
+            HeaderText = "Закрыть",
+            Text = "X",
+            UseColumnTextForButtonValue = true,
+            AutoSizeMode = DataGridViewAutoSizeColumnMode.None,
+            Width = 86,
+            MinimumWidth = 86,
+            FlatStyle = FlatStyle.Popup,
+            DefaultCellStyle =
+            {
+                Alignment = DataGridViewContentAlignment.MiddleCenter,
+                BackColor = Color.FromArgb(96, 39, 34),
+                ForeColor = Color.FromArgb(255, 235, 228),
+                SelectionBackColor = Color.FromArgb(120, 48, 42),
+                SelectionForeColor = Color.White,
+                Font = new Font("Segoe UI", 10F, FontStyle.Bold, GraphicsUnit.Point)
+            }
+        });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "id", HeaderText = "ID", FillWeight = 72 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "host", HeaderText = "Хост", FillWeight = 130 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "status", HeaderText = "Статус", FillWeight = 90 });
@@ -154,15 +174,6 @@ public sealed class LobbyAdminForm : Form
         _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "rounds", HeaderText = "Раунды", FillWeight = 70 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "mirror", HeaderText = "Mirror", FillWeight = 70 });
         _grid.Columns.Add(new DataGridViewTextBoxColumn { Name = "password", HeaderText = "Пароль", FillWeight = 72 });
-        _grid.Columns.Add(new DataGridViewButtonColumn
-        {
-            Name = "close",
-            HeaderText = "",
-            Text = "X",
-            UseColumnTextForButtonValue = true,
-            FillWeight = 46,
-            FlatStyle = FlatStyle.Flat
-        });
 
         return _grid;
     }
@@ -196,14 +207,14 @@ public sealed class LobbyAdminForm : Form
             foreach (var lobby in response.Lobbies)
             {
                 _grid.Rows.Add(
+                    "X",
                     lobby.Id,
                     lobby.HostName,
                     StatusLabel(lobby.Status),
                     $"{lobby.PlayerCount}/{lobby.RequiredPlayers}",
                     lobby.Rounds,
                     lobby.MirrorDraft ? "Да" : "Нет",
-                    lobby.HasPassword ? "Да" : "Нет",
-                    "X"
+                    lobby.HasPassword ? "Да" : "Нет"
                 );
             }
 
