@@ -1,0 +1,32 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "mewgenics-draft-system",
+  "main": "src/worker/index.ts",
+  "compatibility_date": "2025-04-01",
+  "assets": {
+    "directory": "./dist/client",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "durable_objects": {
+    "bindings": [
+      {
+        "name": "LOBBY_REGISTRY",
+        "class_name": "LobbyRegistry"
+      },
+      {
+        "name": "DRAFT_LOBBY",
+        "class_name": "DraftLobby"
+      }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["LobbyRegistry", "DraftLobby"]
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

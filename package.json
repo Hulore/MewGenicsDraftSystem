@@ -1,0 +1,29 @@
+{
+  "name": "mewgenics-draft-system",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "vite build && tsc --noEmit",
+    "dev": "npm run build:client && wrangler dev --local",
+    "build:client": "vite build",
+    "deploy": "npm run build && wrangler deploy",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "lucide-react": "^0.468.0",
+    "matter-js": "^0.20.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250529.0",
+    "@types/matter-js": "^0.19.8",
+    "@types/react": "^18.3.3",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "typescript": "^5.5.4",
+    "vite": "^6.4.2",
+    "wrangler": "^4.18.0"
+  }
+}

@@ -1,0 +1,788 @@
+import { CLASS_IDS, type ClassId } from "../shared/classes";
+import {
+  consumePair,
+  normalizeClassCounts,
+  pairKey,
+  selectDraftPair,
+  validateDraftConfig
+} from "../shared/draftRules";
+import type {
+  ClassCounts,
+  ClientMessage,
+  CreateLobbyRequest,
+  CreatorRole,
+  JoinLobbyRequest,
+  LobbySettings,
+  LobbyStatus,
+  LobbySummary,
+  Participant,
+  PublicLobbyState,
+  RollAttempt,
+  RollState,
+  ServerMessage
+} from "../shared/types";
+
+interface Env {
+  ASSETS: Fetcher;
+  DRAFT_LOBBY: DurableObjectNamespace;
+  LOBBY_REGISTRY: DurableObjectNamespace;
+}
+
+interface InternalLobby {
+  id: string;
+  password: string | null;
+  settings: LobbySettings;
+  status: LobbyStatus;
+  hostParticipantId: string;
+  participants: Record<string, Participant>;
+  sessionIndex: Record<string, string>;
+  playerOrder: string[];
+  remainingCounts: Record<ClassId, number>;
+  usedPairs: string[];
+  playerPools: Record<string, ClassId[]>;
+  completedRounds: PublicLobbyState["completedRounds"];
+  currentRound: PublicLobbyState["currentRound"];
+  roll: RollState | null;
+  lastRoundChooserId: string | null;
+  createdAt: number;
+  updatedAt: number;
+}
+
+const LOBBY_STORAGE_KEY = "lobby";
+const REGISTRY_PREFIX = "lobby:";
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/api/lobbies" && request.method === "GET") {
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      return registry.fetch(new Request("https://registry/list", request));
+    }
+
+    if (url.pathname === "/api/lobbies" && request.method === "POST") {
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      return registry.fetch(new Request("https://registry/create", request));
+    }
+
+    const lobbyRoute = url.pathname.match(/^\/api\/lobbies\/([A-Z0-9]{6})\/(join|state|ws)$/);
+    if (lobbyRoute) {
+      const [, lobbyId, action] = lobbyRoute;
+      const lobby = env.DRAFT_LOBBY.get(env.DRAFT_LOBBY.idFromName(lobbyId));
+      const target = new URL(`https://lobby/${action}`);
+      target.search = url.search;
+      return lobby.fetch(new Request(target, request));
+    }
+
+    return env.ASSETS.fetch(request);
+  }
+};
+
+export class LobbyRegistry {
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Env
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/list" && request.method === "GET") {
+      const entries = await this.state.storage.list<LobbySummary>({ prefix: REGISTRY_PREFIX });
+      const lobbies = [...entries.values()].sort((a, b) => b.updatedAt - a.updatedAt);
+      return json({ lobbies });
+    }
+
+    if (url.pathname === "/create" && request.method === "POST") {
+      const body = await readJson<CreateLobbyRequest>(request);
+      const lobbyId = await this.createLobbyId();
+      const lobby = this.env.DRAFT_LOBBY.get(this.env.DRAFT_LOBBY.idFromName(lobbyId));
+      const initResponse = await lobby.fetch(
+        "https://lobby/init",
+        {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ ...body, lobbyId })
+        }
+      );
+
+      if (!initResponse.ok) {
+        return initResponse;
+      }
+
+      const payload = (await initResponse.json()) as {
+        lobbyId: string;
+        sessionId: string;
+        state: PublicLobbyState;
+      };
+      await this.state.storage.put(`${REGISTRY_PREFIX}${payload.lobbyId}`, toSummary(payload.state));
+
+      return json(payload, 201);
+    }
+
+    if (url.pathname === "/upsert" && request.method === "POST") {
+      const summary = await readJson<LobbySummary>(request);
+      await this.state.storage.put(`${REGISTRY_PREFIX}${summary.id}`, summary);
+      return json({ ok: true });
+    }
+
+    return json({ error: "Not found" }, 404);
+  }
+
+  private async createLobbyId(): Promise<string> {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
+      const id = randomLobbyId();
+      const existing = await this.state.storage.get(`${REGISTRY_PREFIX}${id}`);
+      if (!existing) {
+        return id;
+      }
+    }
+
+    throw new Error("Could not generate unique lobby id.");
+  }
+}
+
+export class DraftLobby {
+  private lobby: InternalLobby | null = null;
+  private readonly sockets = new Map<WebSocket, string>();
+
+  constructor(
+    private readonly state: DurableObjectState,
+    private readonly env: Env
+  ) {}
+
+  async fetch(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+
+    if (url.pathname === "/init" && request.method === "POST") {
+      return this.init(request);
+    }
+
+    if (url.pathname === "/join" && request.method === "POST") {
+      return this.join(request);
+    }
+
+    if (url.pathname === "/state" && request.method === "GET") {
+      const lobby = await this.requireLobby();
+      const sessionId = url.searchParams.get("sessionId") ?? "";
+      return json(this.toPublicState(lobby, sessionId));
+    }
+
+    if (url.pathname === "/ws" && request.headers.get("upgrade") === "websocket") {
+      return this.openSocket(request);
+    }
+
+    return json({ error: "Not found" }, 404);
+  }
+
+  private async init(request: Request): Promise<Response> {
+    const existing = await this.loadLobby();
+    if (existing) {
+      const sessionId = Object.keys(existing.sessionIndex).find(
+        (candidate) => existing.sessionIndex[candidate] === existing.hostParticipantId
+      );
+
+      return json({
+        lobbyId: existing.id,
+        sessionId,
+        state: this.toPublicState(existing, sessionId ?? "")
+      });
+    }
+
+    const body = await readJson<CreateLobbyRequest & { lobbyId: string }>(request);
+    const creatorName = cleanName(body.creatorName);
+    const creatorRole = body.creatorRole === "manager" ? "manager" : "player";
+    const rounds = Math.floor(Number(body.rounds));
+    const classCounts = normalizeClassCounts(body.classCounts ?? {});
+    const validation = validateDraftConfig(classCounts, rounds);
+
+    if (!creatorName) {
+      return json({ error: "Нужно указать имя создателя." }, 400);
+    }
+
+    if (!validation.ok) {
+      return json({ error: validation.blockers.join(" ") }, 400);
+    }
+
+    const now = Date.now();
+    const sessionId = randomToken();
+    const hostParticipantId = randomParticipantId();
+    const settings: LobbySettings = {
+      creatorRole,
+      rounds,
+      mirrorDraft: Boolean(body.mirrorDraft),
+      classCounts
+    };
+
+    const host: Participant = {
+      id: hostParticipantId,
+      name: creatorName,
+      role: creatorRole,
+      slot: creatorRole === "player" ? 1 : null,
+      isHost: true,
+      connected: false,
+      joinedAt: now,
+      lastSeenAt: now
+    };
+
+    const lobby: InternalLobby = {
+      id: body.lobbyId,
+      password: typeof body.password === "string" && body.password.length > 0 ? body.password : null,
+      settings,
+      status: "waiting",
+      hostParticipantId,
+      participants: { [hostParticipantId]: host },
+      sessionIndex: { [sessionId]: hostParticipantId },
+      playerOrder: creatorRole === "player" ? [hostParticipantId] : [],
+      remainingCounts: classCounts,
+      usedPairs: [],
+      playerPools: creatorRole === "player" ? { [hostParticipantId]: [] } : {},
+      completedRounds: [],
+      currentRound: null,
+      roll: null,
+      lastRoundChooserId: null,
+      createdAt: now,
+      updatedAt: now
+    };
+
+    this.lobby = lobby;
+    await this.persist();
+    await this.syncSummary();
+
+    return json({ lobbyId: lobby.id, sessionId, state: this.toPublicState(lobby, sessionId) }, 201);
+  }
+
+  private async join(request: Request): Promise<Response> {
+    const lobby = await this.requireLobby();
+    const body = await readJson<JoinLobbyRequest>(request);
+    const playerName = cleanName(body.playerName);
+
+    if (lobby.status !== "waiting") {
+      return json({ error: "Драфт уже начался." }, 409);
+    }
+
+    if (!playerName) {
+      return json({ error: "Нужно указать имя игрока." }, 400);
+    }
+
+    if (lobby.password && body.password !== lobby.password) {
+      return json({ error: "Неверный пароль лобби." }, 403);
+    }
+
+    if (lobby.playerOrder.length >= 2) {
+      return json({ error: "Лобби уже заполнено." }, 409);
+    }
+
+    const now = Date.now();
+    const sessionId = randomToken();
+    const participantId = randomParticipantId();
+    const slot = lobby.playerOrder.length === 0 ? 1 : 2;
+
+    const participant: Participant = {
+      id: participantId,
+      name: playerName,
+      role: "player",
+      slot,
+      isHost: false,
+      connected: false,
+      joinedAt: now,
+      lastSeenAt: now
+    };
+
+    lobby.participants[participantId] = participant;
+    lobby.sessionIndex[sessionId] = participantId;
+    lobby.playerOrder.push(participantId);
+    lobby.playerPools[participantId] = [];
+    lobby.updatedAt = now;
+
+    await this.persist();
+    await this.syncSummary();
+    this.broadcast(lobby);
+
+    return json({ lobbyId: lobby.id, sessionId, state: this.toPublicState(lobby, sessionId) }, 201);
+  }
+
+  private async openSocket(request: Request): Promise<Response> {
+    const lobby = await this.requireLobby();
+    const url = new URL(request.url);
+    const sessionId = url.searchParams.get("sessionId") ?? "";
+    const participant = this.getParticipantBySession(lobby, sessionId);
+
+    if (!participant) {
+      return json({ error: "Unknown lobby session." }, 401);
+    }
+
+    const pair = new WebSocketPair();
+    const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
+
+    server.accept();
+    this.sockets.set(server, sessionId);
+
+    participant.connected = true;
+    participant.lastSeenAt = Date.now();
+    lobby.updatedAt = participant.lastSeenAt;
+    await this.persist();
+    await this.syncSummary();
+
+    server.addEventListener("message", (event) => {
+      void this.handleSocketMessage(server, event.data);
+    });
+    server.addEventListener("close", () => {
+      void this.handleSocketClose(server);
+    });
+    server.addEventListener("error", () => {
+      void this.handleSocketClose(server);
+    });
+
+    this.send(server, { type: "state", state: this.toPublicState(lobby, sessionId) });
+    this.broadcast(lobby);
+
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  private async handleSocketMessage(socket: WebSocket, data: unknown): Promise<void> {
+    const sessionId = this.sockets.get(socket);
+    if (!sessionId) {
+      return;
+    }
+
+    const lobby = await this.requireLobby();
+    const participant = this.getParticipantBySession(lobby, sessionId);
+    if (!participant) {
+      this.send(socket, { type: "error", message: "Сессия больше не действительна." });
+      return;
+    }
+
+    participant.lastSeenAt = Date.now();
+
+    let message: ClientMessage;
+    try {
+      message = JSON.parse(String(data)) as ClientMessage;
+    } catch {
+      this.send(socket, { type: "error", message: "Некорректное сообщение." });
+      return;
+    }
+
+    try {
+      if (message.type === "startDraft") {
+        await this.startDraft(lobby, sessionId);
+      } else if (message.type === "chooseClass") {
+        await this.chooseClass(lobby, sessionId, message.classId);
+      } else if (message.type === "rollDie") {
+        await this.rollDie(lobby, sessionId);
+      }
+    } catch (error) {
+      this.send(socket, {
+        type: "error",
+        message: error instanceof Error ? error.message : "Action failed."
+      });
+    }
+  }
+
+  private async handleSocketClose(socket: WebSocket): Promise<void> {
+    const sessionId = this.sockets.get(socket);
+    this.sockets.delete(socket);
+
+    if (!sessionId) {
+      return;
+    }
+
+    const lobby = await this.loadLobby();
+    if (!lobby) {
+      return;
+    }
+
+    const participant = this.getParticipantBySession(lobby, sessionId);
+    if (!participant) {
+      return;
+    }
+
+    if (!this.hasActiveSocketForParticipant(lobby, participant.id)) {
+      participant.connected = false;
+      participant.lastSeenAt = Date.now();
+      lobby.updatedAt = participant.lastSeenAt;
+      await this.persist();
+      await this.syncSummary();
+      this.broadcast(lobby);
+    }
+  }
+
+  private async startDraft(lobby: InternalLobby, sessionId: string): Promise<void> {
+    const participant = this.getParticipantBySession(lobby, sessionId);
+
+    if (!participant?.isHost) {
+      throw new Error("Начать драфт может только создатель лобби.");
+    }
+
+    if (lobby.status !== "waiting") {
+      throw new Error("Драфт уже начался.");
+    }
+
+    const blockers = getStartBlockers(lobby);
+    if (blockers.length > 0) {
+      throw new Error(blockers.join(" "));
+    }
+
+    lobby.remainingCounts = normalizeClassCounts(lobby.settings.classCounts);
+    lobby.usedPairs = [];
+    lobby.completedRounds = [];
+    lobby.currentRound = null;
+    lobby.roll = null;
+    lobby.lastRoundChooserId = null;
+    lobby.playerPools = Object.fromEntries(lobby.playerOrder.map((playerId) => [playerId, []]));
+
+    if (lobby.settings.rounds === 1) {
+      this.enterRollStage(lobby, 0);
+    } else {
+      this.prepareRound(lobby, 0);
+    }
+
+    await this.persist();
+    await this.syncSummary();
+    this.broadcast(lobby);
+  }
+
+  private async chooseClass(
+    lobby: InternalLobby,
+    sessionId: string,
+    classId: ClassId
+  ): Promise<void> {
+    const participant = this.getParticipantBySession(lobby, sessionId);
+
+    if (!participant || lobby.status !== "drafting" || !lobby.currentRound) {
+      throw new Error("Сейчас нет активного выбора.");
+    }
+
+    if (participant.id !== lobby.currentRound.chooserId) {
+      throw new Error("Сейчас выбирает другой игрок.");
+    }
+
+    const [firstClass, secondClass] = lobby.currentRound.pair;
+    if (classId !== firstClass && classId !== secondClass) {
+      throw new Error("Этого класса нет в текущем предложении.");
+    }
+
+    const otherClass = classId === firstClass ? secondClass : firstClass;
+    const chooserId = participant.id;
+    const otherPlayerId = lobby.playerOrder.find((playerId) => playerId !== chooserId);
+
+    if (!otherPlayerId) {
+      throw new Error("Не найден второй игрок.");
+    }
+
+    const assigned: Record<string, ClassId[]> = Object.fromEntries(
+      lobby.playerOrder.map((playerId) => [playerId, []])
+    );
+
+    if (lobby.settings.mirrorDraft) {
+      for (const playerId of lobby.playerOrder) {
+        lobby.playerPools[playerId].push(classId);
+        assigned[playerId].push(classId);
+      }
+    } else {
+      lobby.playerPools[chooserId].push(classId);
+      lobby.playerPools[otherPlayerId].push(otherClass);
+      assigned[chooserId].push(classId);
+      assigned[otherPlayerId].push(otherClass);
+    }
+
+    lobby.remainingCounts = consumePair(lobby.remainingCounts, [firstClass, secondClass]);
+    lobby.usedPairs.push(pairKey(firstClass, secondClass));
+    lobby.completedRounds.push({
+      index: lobby.currentRound.index,
+      pair: lobby.currentRound.pair,
+      chooserId,
+      chosenClassId: classId,
+      assigned,
+      completedAt: Date.now()
+    });
+    lobby.currentRound = null;
+
+    const completedCount = lobby.completedRounds.length;
+    if (completedCount >= lobby.settings.rounds) {
+      lobby.status = "complete";
+    } else if (lobby.settings.rounds % 2 === 1 && completedCount === lobby.settings.rounds - 1) {
+      this.enterRollStage(lobby, completedCount);
+    } else {
+      this.prepareRound(lobby, completedCount);
+    }
+
+    lobby.updatedAt = Date.now();
+    await this.persist();
+    await this.syncSummary();
+    this.broadcast(lobby);
+  }
+
+  private async rollDie(lobby: InternalLobby, sessionId: string): Promise<void> {
+    const participant = this.getParticipantBySession(lobby, sessionId);
+
+    if (!participant || participant.role !== "player" || !lobby.playerOrder.includes(participant.id)) {
+      throw new Error("Кубик могут бросать только игроки драфта.");
+    }
+
+    if (lobby.status !== "rolling" || !lobby.roll) {
+      throw new Error("Сейчас нет активного броска кубика.");
+    }
+
+    if (lobby.roll.currentRolls[participant.id] !== undefined) {
+      throw new Error("Ты уже бросил кубик в этой попытке.");
+    }
+
+    lobby.roll.currentRolls[participant.id] = randomInt(1, 6);
+
+    if (lobby.playerOrder.every((playerId) => lobby.roll?.currentRolls[playerId] !== undefined)) {
+      const [firstPlayerId, secondPlayerId] = lobby.playerOrder;
+      const firstRoll = lobby.roll.currentRolls[firstPlayerId];
+      const secondRoll = lobby.roll.currentRolls[secondPlayerId];
+      const tied = firstRoll === secondRoll;
+      const winnerId = tied ? null : firstRoll > secondRoll ? firstPlayerId : secondPlayerId;
+      const attempt: RollAttempt = {
+        attempt: lobby.roll.attempt,
+        rolls: { ...lobby.roll.currentRolls },
+        winnerId,
+        tied,
+        completedAt: Date.now()
+      };
+
+      lobby.roll.history.push(attempt);
+
+      if (tied) {
+        lobby.roll.currentRolls = {};
+        lobby.roll.attempt += 1;
+      } else if (winnerId) {
+        const roundIndex = lobby.roll.roundIndex;
+        lobby.lastRoundChooserId = winnerId;
+        this.prepareRound(lobby, roundIndex, winnerId);
+      }
+    }
+
+    lobby.updatedAt = Date.now();
+    await this.persist();
+    await this.syncSummary();
+    this.broadcast(lobby);
+  }
+
+  private enterRollStage(lobby: InternalLobby, roundIndex: number): void {
+    lobby.status = "rolling";
+    lobby.currentRound = null;
+    lobby.roll = {
+      roundIndex,
+      attempt: 1,
+      currentRolls: {},
+      history: []
+    };
+  }
+
+  private prepareRound(lobby: InternalLobby, roundIndex: number, forcedChooserId?: string): void {
+    const chooserId = forcedChooserId ?? lobby.playerOrder[roundIndex % 2];
+    const pair = selectDraftPair(
+      lobby.remainingCounts,
+      lobby.usedPairs,
+      lobby.settings.rounds - roundIndex - 1
+    );
+
+    if (!pair) {
+      throw new Error("Не удалось собрать корректную пару классов из оставшегося пула.");
+    }
+
+    lobby.status = "drafting";
+    lobby.roll = null;
+    lobby.currentRound = {
+      index: roundIndex,
+      pair,
+      chooserId,
+      startedAt: Date.now()
+    };
+  }
+
+  private toPublicState(lobby: InternalLobby, sessionId: string): PublicLobbyState {
+    const viewerParticipantId = lobby.sessionIndex[sessionId] ?? null;
+
+    return {
+      id: lobby.id,
+      hasPassword: Boolean(lobby.password),
+      settings: lobby.settings,
+      status: lobby.status,
+      hostParticipantId: lobby.hostParticipantId,
+      viewerParticipantId,
+      participants: Object.values(lobby.participants),
+      players: getPlayers(lobby),
+      requiredPlayers: 2,
+      canStart: viewerParticipantId === lobby.hostParticipantId && getStartBlockers(lobby).length === 0,
+      startBlockers: getStartBlockers(lobby),
+      remainingCounts: lobby.remainingCounts,
+      playerPools: lobby.playerPools,
+      completedRounds: lobby.completedRounds,
+      currentRound: lobby.currentRound,
+      roll: lobby.roll,
+      lastRoundChooserId: lobby.lastRoundChooserId,
+      createdAt: lobby.createdAt,
+      updatedAt: lobby.updatedAt
+    };
+  }
+
+  private broadcast(lobby: InternalLobby): void {
+    for (const [socket, sessionId] of this.sockets) {
+      this.send(socket, { type: "state", state: this.toPublicState(lobby, sessionId) });
+    }
+  }
+
+  private send(socket: WebSocket, message: ServerMessage): void {
+    try {
+      socket.send(JSON.stringify(message));
+    } catch {
+      this.sockets.delete(socket);
+    }
+  }
+
+  private getParticipantBySession(lobby: InternalLobby, sessionId: string): Participant | null {
+    const participantId = lobby.sessionIndex[sessionId];
+    return participantId ? lobby.participants[participantId] ?? null : null;
+  }
+
+  private hasActiveSocketForParticipant(lobby: InternalLobby, participantId: string): boolean {
+    for (const sessionId of this.sockets.values()) {
+      if (lobby.sessionIndex[sessionId] === participantId) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private async loadLobby(): Promise<InternalLobby | null> {
+    if (!this.lobby) {
+      this.lobby = (await this.state.storage.get<InternalLobby>(LOBBY_STORAGE_KEY)) ?? null;
+    }
+
+    return this.lobby;
+  }
+
+  private async requireLobby(): Promise<InternalLobby> {
+    const lobby = await this.loadLobby();
+
+    if (!lobby) {
+      throw new Error("Lobby does not exist.");
+    }
+
+    return lobby;
+  }
+
+  private async persist(): Promise<void> {
+    if (this.lobby) {
+      await this.state.storage.put(LOBBY_STORAGE_KEY, this.lobby);
+    }
+  }
+
+  private async syncSummary(): Promise<void> {
+    if (!this.lobby) {
+      return;
+    }
+
+    const registry = this.env.LOBBY_REGISTRY.get(this.env.LOBBY_REGISTRY.idFromName("global"));
+    try {
+      await registry.fetch("https://registry/upsert", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(toSummary(this.toPublicState(this.lobby, "")))
+      });
+    } catch {
+      // Registry sync is best-effort; the lobby itself remains authoritative.
+    }
+  }
+}
+
+function getStartBlockers(lobby: InternalLobby): string[] {
+  const blockers: string[] = [];
+  const players = getPlayers(lobby);
+
+  if (players.length < 2) {
+    blockers.push(`Нужно еще игроков: ${2 - players.length}.`);
+  }
+
+  if (players.length === 2 && players.some((player) => !player.connected)) {
+    blockers.push("Оба игрока должны быть подключены.");
+  }
+
+  const validation = validateDraftConfig(
+    lobby.settings.classCounts,
+    lobby.settings.rounds,
+    lobby.usedPairs
+  );
+  blockers.push(...validation.blockers);
+
+  return blockers;
+}
+
+function getPlayers(lobby: InternalLobby): Participant[] {
+  return lobby.playerOrder.map((playerId) => lobby.participants[playerId]).filter(Boolean);
+}
+
+function toSummary(state: PublicLobbyState): LobbySummary {
+  const host = state.participants.find((participant) => participant.id === state.hostParticipantId);
+
+  return {
+    id: state.id,
+    hostName: host?.name ?? "Unknown",
+    creatorRole: state.settings.creatorRole,
+    hasPassword: state.hasPassword,
+    status: state.status,
+    playerCount: state.players.length,
+    requiredPlayers: state.requiredPlayers,
+    rounds: state.settings.rounds,
+    mirrorDraft: state.settings.mirrorDraft,
+    createdAt: state.createdAt,
+    updatedAt: state.updatedAt
+  };
+}
+
+async function readJson<T>(request: Request): Promise<T> {
+  try {
+    return (await request.json()) as T;
+  } catch {
+    throw new Error("Тело запроса должно быть валидным JSON.");
+  }
+}
+
+function json(data: unknown, status = 200): Response {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=utf-8"
+    }
+  });
+}
+
+function cleanName(value: unknown): string {
+  if (typeof value !== "string") {
+    return "";
+  }
+
+  return value.trim().replace(/\s+/g, " ").slice(0, 24);
+}
+
+function randomLobbyId(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  let id = "";
+
+  for (let i = 0; i < 6; i += 1) {
+    id += alphabet[randomInt(0, alphabet.length - 1)];
+  }
+
+  return id;
+}
+
+function randomParticipantId(): string {
+  return `p_${randomToken().slice(0, 16)}`;
+}
+
+function randomToken(): string {
+  return crypto.randomUUID().replaceAll("-", "");
+}
+
+function randomInt(minInclusive: number, maxInclusive: number): number {
+  const range = maxInclusive - minInclusive + 1;
+  const value = new Uint32Array(1);
+  crypto.getRandomValues(value);
+  return minInclusive + (value[0] % range);
+}
