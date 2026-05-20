@@ -771,6 +771,7 @@ export class DraftLobby {
 
   private toPublicState(lobby: InternalLobby, sessionId: string): PublicLobbyState {
     const viewerParticipantId = lobby.sessionIndex[sessionId] ?? null;
+    const startBlockers = getStartBlockers(lobby);
 
     return {
       id: lobby.id,
@@ -782,8 +783,11 @@ export class DraftLobby {
       participants: Object.values(lobby.participants),
       players: getPlayers(lobby),
       requiredPlayers: 2,
-      canStart: viewerParticipantId === lobby.hostParticipantId && getStartBlockers(lobby).length === 0,
-      startBlockers: getStartBlockers(lobby),
+      canStart:
+        lobby.status === "waiting" &&
+        viewerParticipantId === lobby.hostParticipantId &&
+        startBlockers.length === 0,
+      startBlockers: lobby.status === "waiting" ? startBlockers : [],
       remainingCounts: lobby.remainingCounts,
       playerPools: lobby.playerPools,
       completedRounds: lobby.completedRounds,
