@@ -80,7 +80,7 @@ export default {
       return registry.fetch("https://registry/admin-close-all", { method: "POST" });
     }
 
-    const adminCloseRoute = url.pathname.match(/^\/api\/admin\/lobbies\/([A-Z0-9]{6})\/close$/);
+    const adminCloseRoute = url.pathname.match(/^\/api\/admin\/lobbies\/([a-zA-Z0-9]{6})\/close\/?$/);
     if (adminCloseRoute && request.method === "POST") {
       if (!isAuthorizedAdmin(request, env)) {
         return json({ error: "Not found" }, 404);
@@ -91,7 +91,7 @@ export default {
       return registry.fetch("https://registry/admin-close", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify({ id: lobbyId })
+        body: JSON.stringify({ id: lobbyId.toUpperCase() })
       });
     }
 
@@ -105,13 +105,17 @@ export default {
       return registry.fetch(new Request("https://registry/create", request));
     }
 
-    const lobbyRoute = url.pathname.match(/^\/api\/lobbies\/([A-Z0-9]{6})\/(join|state|ws|results)$/);
+    const lobbyRoute = url.pathname.match(/^\/api\/lobbies\/([a-zA-Z0-9]{6})\/(join|state|ws|results)\/?$/);
     if (lobbyRoute) {
       const [, lobbyId, action] = lobbyRoute;
-      const lobby = env.DRAFT_LOBBY.get(env.DRAFT_LOBBY.idFromName(lobbyId));
+      const lobby = env.DRAFT_LOBBY.get(env.DRAFT_LOBBY.idFromName(lobbyId.toUpperCase()));
       const target = new URL(`https://lobby/${action}`);
       target.search = url.search;
       return lobby.fetch(new Request(target, request));
+    }
+
+    if (url.pathname.startsWith("/api/")) {
+      return json({ error: "API endpoint not found." }, 404);
     }
 
     return env.ASSETS.fetch(request);
