@@ -72,20 +72,12 @@ export interface RollState {
   history: RollAttempt[];
 }
 
-export interface PublicClassResult {
-  id: ClassId;
-  name: string;
-  icon: string;
-}
-
 export interface PublicResultsPlayer {
-  slot: 1 | 2;
   name: string;
-  classes: PublicClassResult[];
+  classes: string[];
 }
 
 export interface PublicLobbyResults {
-  id: string;
   players: PublicResultsPlayer[];
 }
 

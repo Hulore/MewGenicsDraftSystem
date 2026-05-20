@@ -14,7 +14,6 @@ import type {
   JoinLobbyRequest,
   LobbySettings,
   LobbyStatus,
-  PublicClassResult,
   PublicLobbyResults,
   LobbySummary,
   Participant,
@@ -832,11 +831,9 @@ export class DraftLobby {
     const players = getPlayers(lobby);
 
     return {
-      id: lobby.id,
       players: players.map((player) => ({
-        slot: player.slot as 1 | 2,
         name: player.name,
-        classes: (lobby.playerPools[player.id] ?? []).map(toClassResult)
+        classes: (lobby.playerPools[player.id] ?? []).map((classId) => CLASS_BY_ID[classId].name)
       }))
     };
   }
@@ -1025,16 +1022,6 @@ function isDraftCompleted(lobby: InternalLobby): boolean {
     (lobby.status === "complete" || lobby.status === "closed") &&
     lobby.completedRounds.length >= lobby.settings.rounds
   );
-}
-
-function toClassResult(classId: ClassId): PublicClassResult {
-  const classInfo = CLASS_BY_ID[classId];
-
-  return {
-    id: classId,
-    name: classInfo.name,
-    icon: classInfo.icon
-  };
 }
 
 function toSummary(state: PublicLobbyState): LobbySummary {
