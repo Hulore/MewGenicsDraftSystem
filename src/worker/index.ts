@@ -1,4 +1,4 @@
-import { CLASS_IDS, type ClassId } from "../shared/classes";
+import { CLASS_BY_ID, CLASS_IDS, type ClassId } from "../shared/classes";
 import {
   consumePair,
   normalizeClassCounts,
@@ -14,6 +14,8 @@ import type {
   JoinLobbyRequest,
   LobbySettings,
   LobbyStatus,
+  PublicClassResult,
+  PublicLobbyResults,
   LobbySummary,
   Participant,
   PublicLobbyState,
@@ -103,7 +105,7 @@ export default {
       return registry.fetch(new Request("https://registry/create", request));
     }
 
-    const lobbyRoute = url.pathname.match(/^\/api\/lobbies\/([A-Z0-9]{6})\/(join|state|ws)$/);
+    const lobbyRoute = url.pathname.match(/^\/api\/lobbies\/([A-Z0-9]{6})\/(join|state|ws|results)$/);
     if (lobbyRoute) {
       const [, lobbyId, action] = lobbyRoute;
       const lobby = env.DRAFT_LOBBY.get(env.DRAFT_LOBBY.idFromName(lobbyId));
@@ -260,6 +262,10 @@ export class DraftLobby {
       const lobby = await this.requireLobby();
       const sessionId = url.searchParams.get("sessionId") ?? "";
       return json(this.toPublicState(lobby, sessionId));
+    }
+
+    if (url.pathname === "/results" && request.method === "GET") {
+      return this.results();
     }
 
     if (url.pathname === "/ws" && request.headers.get("upgrade") === "websocket") {
@@ -438,6 +444,24 @@ export class DraftLobby {
     this.broadcast(lobby);
 
     return json({ lobbyId: lobby.id, sessionId, state: this.toPublicState(lobby, sessionId) }, 201);
+  }
+
+  private async results(): Promise<Response> {
+    const lobby = await this.loadLobby();
+
+    if (!lobby) {
+      return json({ error: "Лобби не найдено." }, 404);
+    }
+
+    if (lobby.status !== "closed" && lobby.autoCloseAt <= Date.now()) {
+      await this.autoCloseLobby(lobby);
+    }
+
+    if (!isDraftCompleted(lobby)) {
+      return json({ error: "Результаты доступны только после завершения драфта." }, 409);
+    }
+
+    return json(this.toPublicResults(lobby));
   }
 
   private async openSocket(request: Request): Promise<Response> {
@@ -800,6 +824,65 @@ export class DraftLobby {
     };
   }
 
+  private toPublicResults(lobby: InternalLobby): PublicLobbyResults {
+    const players = getPlayers(lobby);
+    const playerById = Object.fromEntries(players.map((player) => [player.id, player]));
+    const completedAt = lobby.completedRounds.at(-1)?.completedAt ?? null;
+
+    return {
+      id: lobby.id,
+      status: lobby.status,
+      rounds: lobby.settings.rounds,
+      mirrorDraft: lobby.settings.mirrorDraft,
+      players: players.map((player) => ({
+        slot: player.slot as 1 | 2,
+        name: player.name,
+        isHost: player.isHost,
+        classes: (lobby.playerPools[player.id] ?? []).map(toClassResult)
+      })),
+      completedRounds: lobby.completedRounds.map((round) => {
+        const chooser = playerById[round.chooserId] ?? players[0];
+
+        return {
+          index: round.index,
+          pair: [toClassResult(round.pair[0]), toClassResult(round.pair[1])] as [
+            PublicClassResult,
+            PublicClassResult
+          ],
+          chooser: {
+            slot: (chooser?.slot ?? 1) as 1 | 2,
+            name: chooser?.name ?? "Player 1"
+          },
+          chosenClass: toClassResult(round.chosenClassId),
+          assigned: Object.entries(round.assigned)
+            .map(([playerId, classIds]) => {
+              const player = playerById[playerId];
+
+              if (!player?.slot) {
+                return null;
+              }
+
+              return {
+                slot: player.slot,
+                name: player.name,
+                classes: classIds.map(toClassResult)
+              };
+            })
+            .filter((assignment): assignment is {
+              slot: 1 | 2;
+              name: string;
+              classes: PublicClassResult[];
+            } => Boolean(assignment)),
+          completedAt: round.completedAt
+        };
+      }),
+      createdAt: lobby.createdAt,
+      completedAt,
+      updatedAt: lobby.updatedAt,
+      autoCloseAt: lobby.autoCloseAt
+    };
+  }
+
   private broadcast(lobby: InternalLobby): void {
     for (const [socket, sessionId] of this.sockets) {
       this.send(socket, { type: "state", state: this.toPublicState(lobby, sessionId) });
@@ -977,6 +1060,23 @@ function getStartBlockers(lobby: InternalLobby): string[] {
 
 function getPlayers(lobby: InternalLobby): Participant[] {
   return lobby.playerOrder.map((playerId) => lobby.participants[playerId]).filter(Boolean);
+}
+
+function isDraftCompleted(lobby: InternalLobby): boolean {
+  return (
+    (lobby.status === "complete" || lobby.status === "closed") &&
+    lobby.completedRounds.length >= lobby.settings.rounds
+  );
+}
+
+function toClassResult(classId: ClassId): PublicClassResult {
+  const classInfo = CLASS_BY_ID[classId];
+
+  return {
+    id: classId,
+    name: classInfo.name,
+    icon: classInfo.icon
+  };
 }
 
 function toSummary(state: PublicLobbyState): LobbySummary {

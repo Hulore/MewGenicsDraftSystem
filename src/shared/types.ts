@@ -72,6 +72,48 @@ export interface RollState {
   history: RollAttempt[];
 }
 
+export interface PublicClassResult {
+  id: ClassId;
+  name: string;
+  icon: string;
+}
+
+export interface PublicResultsPlayer {
+  slot: 1 | 2;
+  name: string;
+  isHost: boolean;
+  classes: PublicClassResult[];
+}
+
+export interface PublicResultsRound {
+  index: number;
+  pair: [PublicClassResult, PublicClassResult];
+  chooser: {
+    slot: 1 | 2;
+    name: string;
+  };
+  chosenClass: PublicClassResult;
+  assigned: Array<{
+    slot: 1 | 2;
+    name: string;
+    classes: PublicClassResult[];
+  }>;
+  completedAt: number;
+}
+
+export interface PublicLobbyResults {
+  id: string;
+  status: LobbyStatus;
+  rounds: number;
+  mirrorDraft: boolean;
+  players: PublicResultsPlayer[];
+  completedRounds: PublicResultsRound[];
+  createdAt: number;
+  completedAt: number | null;
+  updatedAt: number;
+  autoCloseAt: number;
+}
+
 export interface PublicLobbyState {
   id: string;
   hasPassword: boolean;
