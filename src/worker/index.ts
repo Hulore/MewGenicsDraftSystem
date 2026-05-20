@@ -826,60 +826,14 @@ export class DraftLobby {
 
   private toPublicResults(lobby: InternalLobby): PublicLobbyResults {
     const players = getPlayers(lobby);
-    const playerById = Object.fromEntries(players.map((player) => [player.id, player]));
-    const completedAt = lobby.completedRounds.at(-1)?.completedAt ?? null;
 
     return {
       id: lobby.id,
-      status: lobby.status,
-      rounds: lobby.settings.rounds,
-      mirrorDraft: lobby.settings.mirrorDraft,
       players: players.map((player) => ({
         slot: player.slot as 1 | 2,
         name: player.name,
-        isHost: player.isHost,
         classes: (lobby.playerPools[player.id] ?? []).map(toClassResult)
-      })),
-      completedRounds: lobby.completedRounds.map((round) => {
-        const chooser = playerById[round.chooserId] ?? players[0];
-
-        return {
-          index: round.index,
-          pair: [toClassResult(round.pair[0]), toClassResult(round.pair[1])] as [
-            PublicClassResult,
-            PublicClassResult
-          ],
-          chooser: {
-            slot: (chooser?.slot ?? 1) as 1 | 2,
-            name: chooser?.name ?? "Player 1"
-          },
-          chosenClass: toClassResult(round.chosenClassId),
-          assigned: Object.entries(round.assigned)
-            .map(([playerId, classIds]) => {
-              const player = playerById[playerId];
-
-              if (!player?.slot) {
-                return null;
-              }
-
-              return {
-                slot: player.slot,
-                name: player.name,
-                classes: classIds.map(toClassResult)
-              };
-            })
-            .filter((assignment): assignment is {
-              slot: 1 | 2;
-              name: string;
-              classes: PublicClassResult[];
-            } => Boolean(assignment)),
-          completedAt: round.completedAt
-        };
-      }),
-      createdAt: lobby.createdAt,
-      completedAt,
-      updatedAt: lobby.updatedAt,
-      autoCloseAt: lobby.autoCloseAt
+      }))
     };
   }
 
