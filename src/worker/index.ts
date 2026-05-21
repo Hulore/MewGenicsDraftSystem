@@ -15,6 +15,7 @@ import type {
   LobbySettings,
   LobbyStatus,
   PublicLobbyResults,
+  PublicResultsPlayer,
   LobbySummary,
   Participant,
   PublicLobbyState,
@@ -56,8 +57,14 @@ interface RegistryLobbyRecord extends LobbySummary {
   participantNames?: string[];
 }
 
+interface StoredPlayerResult extends PublicResultsPlayer {
+  lobbyId: string;
+  completedAt: number;
+}
+
 const LOBBY_STORAGE_KEY = "lobby";
 const REGISTRY_PREFIX = "lobby:";
+const PLAYER_RESULT_PREFIX = "player-result:";
 const ROLL_REVEAL_DELAY_MS = 2200;
 const LOBBY_IDLE_AUTO_CLOSE_MS = 15 * 60 * 1000;
 
@@ -106,6 +113,22 @@ export default {
     if (url.pathname === "/api/lobbies" && request.method === "POST") {
       const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
       return registry.fetch(new Request("https://registry/create", request));
+    }
+
+    if (url.pathname === "/api/player-results" && request.method === "GET") {
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      const target = new URL("https://registry/player-results");
+      target.search = url.search;
+      return registry.fetch(new Request(target, request));
+    }
+
+    const playerResultsRoute = url.pathname.match(/^\/api\/players\/(.+)\/results\/?$/);
+    if (playerResultsRoute && request.method === "GET") {
+      const [, rawName] = playerResultsRoute;
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      const target = new URL("https://registry/player-results");
+      target.searchParams.set("name", safeDecodeURIComponent(rawName));
+      return registry.fetch(new Request(target, request));
     }
 
     const lobbyRoute = url.pathname.match(/^\/api\/lobbies\/([a-zA-Z0-9]{6})\/(join|state|ws|results)\/?$/);
@@ -184,6 +207,16 @@ export class LobbyRegistry {
       });
     }
 
+    if (url.pathname === "/player-results" && request.method === "GET") {
+      return this.playerResults(url.searchParams.get("name"));
+    }
+
+    if (url.pathname === "/player-results/upsert" && request.method === "POST") {
+      const body = await readJson<{ results: StoredPlayerResult[] }>(request);
+      await this.upsertPlayerResults(body.results);
+      return json({ ok: true });
+    }
+
     if (url.pathname === "/remove" && request.method === "POST") {
       const body = await readJson<{ id: string }>(request);
       await this.state.storage.delete(`${REGISTRY_PREFIX}${body.id}`);
@@ -209,6 +242,89 @@ export class LobbyRegistry {
     }
 
     return json({ error: "Not found" }, 404);
+  }
+
+  private async playerResults(rawName: unknown): Promise<Response> {
+    const playerName = cleanName(rawName);
+
+    if (!playerName) {
+      return json({ error: "Нужно указать имя игрока." }, 400);
+    }
+
+    const refreshedResult = await this.findAndStoreCompletedPlayerResult(playerName);
+    if (refreshedResult) {
+      return json(toPublicPlayerResult(refreshedResult));
+    }
+
+    if (await this.isNameUsedInActiveLobby(playerName)) {
+      return json({ error: "Драфт этого игрока ещё не завершён." }, 409);
+    }
+
+    const storedResult = await this.getStoredPlayerResult(playerName);
+    if (storedResult) {
+      return json(toPublicPlayerResult(storedResult));
+    }
+
+    return json({ error: "Результаты для игрока не найдены." }, 404);
+  }
+
+  private async upsertPlayerResults(results: StoredPlayerResult[]): Promise<void> {
+    for (const result of results) {
+      const key = getPlayerResultKey(result.name);
+      if (!key) {
+        continue;
+      }
+
+      await this.state.storage.put(key, result);
+    }
+  }
+
+  private async getStoredPlayerResult(name: string): Promise<StoredPlayerResult | null> {
+    const key = getPlayerResultKey(name);
+    return key ? (await this.state.storage.get<StoredPlayerResult>(key)) ?? null : null;
+  }
+
+  private async findAndStoreCompletedPlayerResult(name: string): Promise<StoredPlayerResult | null> {
+    const normalizedName = normalizeNameForLookup(name);
+    const records = await this.listActiveLobbyRecords();
+
+    for (const record of records) {
+      if (
+        !getRegistryParticipantNames(record).some(
+          (participantName) => normalizeNameForLookup(participantName) === normalizedName
+        )
+      ) {
+        continue;
+      }
+
+      const result = await this.fetchPlayerResultFromLobby(record.id, name);
+      if (result) {
+        await this.upsertPlayerResults([result]);
+        return result;
+      }
+    }
+
+    return null;
+  }
+
+  private async fetchPlayerResultFromLobby(
+    lobbyId: string,
+    name: string
+  ): Promise<StoredPlayerResult | null> {
+    const lobby = this.env.DRAFT_LOBBY.get(this.env.DRAFT_LOBBY.idFromName(lobbyId));
+    const target = new URL("https://lobby/player-result");
+    target.searchParams.set("name", name);
+
+    try {
+      const response = await lobby.fetch(target, { method: "GET" });
+      if (!response.ok) {
+        return null;
+      }
+
+      return (await response.json()) as StoredPlayerResult;
+    } catch {
+      return null;
+    }
   }
 
   private async closeLobbyById(id: string): Promise<string[]> {
@@ -336,6 +452,10 @@ export class DraftLobby {
 
     if (url.pathname === "/registry-record" && request.method === "GET") {
       return this.registryRecord();
+    }
+
+    if (url.pathname === "/player-result" && request.method === "GET") {
+      return this.playerResult(url.searchParams.get("name"));
     }
 
     if (url.pathname === "/results" && request.method === "GET") {
@@ -478,6 +598,29 @@ export class DraftLobby {
     }
 
     return json(toRegistryRecord(this.toPublicState(lobby, "")));
+  }
+
+  private async playerResult(rawName: unknown): Promise<Response> {
+    const playerName = cleanName(rawName);
+    const lobby = await this.loadLobby();
+
+    if (!lobby) {
+      return json({ error: "Лобби не найдено." }, 404);
+    }
+
+    const player = getPlayers(lobby).find(
+      (candidate) => normalizeNameForLookup(candidate.name) === normalizeNameForLookup(playerName)
+    );
+
+    if (!player) {
+      return json({ error: "Игрок не найден в этом лобби." }, 404);
+    }
+
+    if (!isDraftCompleted(lobby)) {
+      return json({ error: "Драфт этого игрока ещё не завершён." }, 409);
+    }
+
+    return json(this.toStoredPlayerResult(lobby, player));
   }
 
   private async join(request: Request): Promise<Response> {
@@ -833,6 +976,7 @@ export class DraftLobby {
       throw new Error("Лобби можно закрыть только после завершения драфта.");
     }
 
+    await this.syncPlayerResults(lobby);
     this.markLobbyClosed(lobby);
 
     await this.persist();
@@ -844,6 +988,10 @@ export class DraftLobby {
     const lobby = await this.loadLobby();
     if (!lobby) {
       return json({ ok: true });
+    }
+
+    if (isDraftCompleted(lobby)) {
+      await this.syncPlayerResults(lobby);
     }
 
     this.markLobbyClosed(lobby);
@@ -931,6 +1079,15 @@ export class DraftLobby {
     };
   }
 
+  private toStoredPlayerResult(lobby: InternalLobby, player: Participant): StoredPlayerResult {
+    return {
+      name: player.name,
+      classes: (lobby.playerPools[player.id] ?? []).map((classId) => CLASS_BY_ID[classId].name),
+      lobbyId: lobby.id,
+      completedAt: getLobbyCompletedAt(lobby)
+    };
+  }
+
   private broadcast(lobby: InternalLobby): void {
     for (const [socket, sessionId] of this.sockets) {
       this.send(socket, { type: "state", state: this.toPublicState(lobby, sessionId) });
@@ -991,6 +1148,10 @@ export class DraftLobby {
   }
 
   private async autoCloseLobby(lobby: InternalLobby, now = Date.now()): Promise<void> {
+    if (isDraftCompleted(lobby)) {
+      await this.syncPlayerResults(lobby);
+    }
+
     this.markLobbyClosed(lobby, now);
     await this.persist();
     await this.removeSummary();
@@ -1065,6 +1226,10 @@ export class DraftLobby {
       return;
     }
 
+    if (isDraftCompleted(this.lobby)) {
+      await this.syncPlayerResults(this.lobby);
+    }
+
     if (this.lobby.status === "closed") {
       await this.removeSummary();
       return;
@@ -1079,6 +1244,21 @@ export class DraftLobby {
       });
     } catch {
       // Registry sync is best-effort; the lobby itself remains authoritative.
+    }
+  }
+
+  private async syncPlayerResults(lobby: InternalLobby): Promise<void> {
+    const results = getPlayers(lobby).map((player) => this.toStoredPlayerResult(lobby, player));
+    const registry = this.env.LOBBY_REGISTRY.get(this.env.LOBBY_REGISTRY.idFromName("global"));
+
+    try {
+      await registry.fetch("https://registry/player-results/upsert", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ results })
+      });
+    } catch {
+      // Result sync is best-effort; lobby results by ID remain authoritative.
     }
   }
 
@@ -1133,6 +1313,10 @@ function isDraftCompleted(lobby: InternalLobby): boolean {
   );
 }
 
+function getLobbyCompletedAt(lobby: InternalLobby): number {
+  return lobby.completedRounds.at(-1)?.completedAt ?? lobby.updatedAt;
+}
+
 function toSummary(state: PublicLobbyState): LobbySummary {
   const host = state.participants.find((participant) => participant.id === state.hostParticipantId);
 
@@ -1166,6 +1350,18 @@ function toPublicSummary(record: RegistryLobbyRecord): LobbySummary {
 
 function getRegistryParticipantNames(record: RegistryLobbyRecord): string[] {
   return record.participantNames?.length ? record.participantNames : [record.hostName];
+}
+
+function toPublicPlayerResult(result: StoredPlayerResult): PublicResultsPlayer {
+  return {
+    name: result.name,
+    classes: result.classes
+  };
+}
+
+function getPlayerResultKey(name: string): string | null {
+  const normalizedName = normalizeNameForLookup(name);
+  return normalizedName ? `${PLAYER_RESULT_PREFIX}${normalizedName}` : null;
 }
 
 function getSummaryAutoCloseAt(summary: LobbySummary): number {
@@ -1213,6 +1409,14 @@ function cleanName(value: unknown): string {
 
 function normalizeNameForLookup(value: unknown): string {
   return cleanName(value).toLowerCase();
+}
+
+function safeDecodeURIComponent(value: string): string {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return value;
+  }
 }
 
 function randomLobbyId(): string {
