@@ -580,14 +580,20 @@ function WaitingLobby({
         )}
 
         {viewerIsHost && (
-          <button
-            className="primary-button"
-            disabled={!state.canStart}
-            onClick={() => send({ type: "startDraft" })}
-          >
-            <Play size={18} />
-            Начать драфт
-          </button>
+          <div className="lobby-actions">
+            <button
+              className="primary-button"
+              disabled={!state.canStart}
+              onClick={() => send({ type: "startDraft" })}
+            >
+              <Play size={18} />
+              Начать драфт
+            </button>
+            <button className="danger-button" onClick={() => send({ type: "closeLobby" })}>
+              <X size={18} />
+              Закрыть лобби
+            </button>
+          </div>
         )}
       </section>
     </div>
@@ -792,7 +798,7 @@ function ClosedLobby({
           </div>
           <X size={24} />
         </div>
-        <p>{host?.name ?? "Создатель"} закрыл лобби после завершения драфта.</p>
+        <p>{host?.name ?? "Создатель"} закрыл лобби.</p>
         <button className="primary-button" onClick={onLeave}>
           <ChevronLeft size={18} />
           К списку лобби

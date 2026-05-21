@@ -507,6 +507,11 @@ input:focus {
   margin-bottom: 14px;
 }
 
+.lobby-actions {
+  display: grid;
+  gap: 10px;
+}
+
 .join-panel {
   width: min(520px, 100%);
 }

@@ -972,11 +972,14 @@ export class DraftLobby {
       throw new Error("Закрыть лобби может только создатель.");
     }
 
-    if (lobby.status !== "complete") {
-      throw new Error("Лобби можно закрыть только после завершения драфта.");
+    if (lobby.status !== "waiting" && lobby.status !== "complete") {
+      throw new Error("Лобби можно закрыть во время ожидания игроков или после завершения драфта.");
     }
 
-    await this.syncPlayerResults(lobby);
+    if (isDraftCompleted(lobby)) {
+      await this.syncPlayerResults(lobby);
+    }
+
     this.markLobbyClosed(lobby);
 
     await this.persist();
