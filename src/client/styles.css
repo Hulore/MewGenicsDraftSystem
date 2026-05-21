@@ -468,6 +468,8 @@ input:focus {
 
 .lobby-list {
   display: grid;
+  align-content: start;
+  grid-auto-rows: minmax(76px, max-content);
   gap: 9px;
   max-height: 610px;
   overflow: auto;
