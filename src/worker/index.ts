@@ -52,6 +52,10 @@ interface InternalLobby {
   autoCloseAt: number;
 }
 
+interface RegistryLobbyRecord extends LobbySummary {
+  participantNames?: string[];
+}
+
 const LOBBY_STORAGE_KEY = "lobby";
 const REGISTRY_PREFIX = "lobby:";
 const ROLL_REVEAL_DELAY_MS = 2200;
@@ -136,6 +140,12 @@ export class LobbyRegistry {
 
     if (url.pathname === "/create" && request.method === "POST") {
       const body = await readJson<CreateLobbyRequest>(request);
+      const creatorName = cleanName(body.creatorName);
+
+      if (creatorName && (await this.isNameUsedInActiveLobby(creatorName))) {
+        return json({ error: `Имя "${creatorName}" уже используется в другом лобби.` }, 409);
+      }
+
       const lobbyId = await this.createLobbyId();
       const lobby = this.env.DRAFT_LOBBY.get(this.env.DRAFT_LOBBY.idFromName(lobbyId));
       const initResponse = await lobby.fetch(
@@ -156,15 +166,22 @@ export class LobbyRegistry {
         sessionId: string;
         state: PublicLobbyState;
       };
-      await this.state.storage.put(`${REGISTRY_PREFIX}${payload.lobbyId}`, toSummary(payload.state));
+      await this.state.storage.put(`${REGISTRY_PREFIX}${payload.lobbyId}`, toRegistryRecord(payload.state));
 
       return json(payload, 201);
     }
 
     if (url.pathname === "/upsert" && request.method === "POST") {
-      const summary = await readJson<LobbySummary>(request);
+      const summary = await readJson<RegistryLobbyRecord>(request);
       await this.state.storage.put(`${REGISTRY_PREFIX}${summary.id}`, summary);
       return json({ ok: true });
+    }
+
+    if (url.pathname === "/name-check" && request.method === "POST") {
+      const body = await readJson<{ name: string; excludeLobbyId?: string }>(request);
+      return json({
+        used: await this.isNameUsedInActiveLobby(body.name, body.excludeLobbyId?.toUpperCase())
+      });
     }
 
     if (url.pathname === "/remove" && request.method === "POST") {
@@ -195,7 +212,7 @@ export class LobbyRegistry {
   }
 
   private async closeLobbyById(id: string): Promise<string[]> {
-    const summary = await this.state.storage.get<LobbySummary>(`${REGISTRY_PREFIX}${id}`);
+    const summary = await this.state.storage.get<RegistryLobbyRecord>(`${REGISTRY_PREFIX}${id}`);
     if (!summary) {
       return [];
     }
@@ -207,11 +224,34 @@ export class LobbyRegistry {
   }
 
   private async listVisibleLobbies(): Promise<LobbySummary[]> {
-    const entries = await this.state.storage.list<LobbySummary>({ prefix: REGISTRY_PREFIX });
-    const now = Date.now();
-    const lobbies: LobbySummary[] = [];
+    const records = await this.listActiveLobbyRecords();
+    return records.map(toPublicSummary).sort((a, b) => b.updatedAt - a.updatedAt);
+  }
 
-    for (const summary of entries.values()) {
+  private async isNameUsedInActiveLobby(name: string, excludeLobbyId?: string): Promise<boolean> {
+    const normalizedName = normalizeNameForLookup(name);
+    if (!normalizedName) {
+      return false;
+    }
+
+    const records = await this.listActiveLobbyRecords();
+    return records.some((record) => {
+      if (excludeLobbyId && record.id === excludeLobbyId) {
+        return false;
+      }
+
+      return getRegistryParticipantNames(record).some(
+        (participantName) => normalizeNameForLookup(participantName) === normalizedName
+      );
+    });
+  }
+
+  private async listActiveLobbyRecords(): Promise<RegistryLobbyRecord[]> {
+    const entries = await this.state.storage.list<RegistryLobbyRecord>({ prefix: REGISTRY_PREFIX });
+    const now = Date.now();
+    const lobbies: RegistryLobbyRecord[] = [];
+
+    for (let summary of entries.values()) {
       if (summary.status === "closed") {
         await this.state.storage.delete(`${REGISTRY_PREFIX}${summary.id}`);
         continue;
@@ -222,10 +262,37 @@ export class LobbyRegistry {
         continue;
       }
 
+      if (!summary.participantNames?.length) {
+        const refreshedSummary = await this.refreshLobbyRecord(summary);
+        if (!refreshedSummary || refreshedSummary.status === "closed") {
+          await this.state.storage.delete(`${REGISTRY_PREFIX}${summary.id}`);
+          continue;
+        }
+
+        summary = refreshedSummary;
+      }
+
       lobbies.push(summary);
     }
 
-    return lobbies.sort((a, b) => b.updatedAt - a.updatedAt);
+    return lobbies;
+  }
+
+  private async refreshLobbyRecord(summary: RegistryLobbyRecord): Promise<RegistryLobbyRecord | null> {
+    const lobby = this.env.DRAFT_LOBBY.get(this.env.DRAFT_LOBBY.idFromName(summary.id));
+
+    try {
+      const response = await lobby.fetch("https://lobby/registry-record", { method: "GET" });
+      if (!response.ok) {
+        return null;
+      }
+
+      const refreshedSummary = (await response.json()) as RegistryLobbyRecord;
+      await this.state.storage.put(`${REGISTRY_PREFIX}${refreshedSummary.id}`, refreshedSummary);
+      return refreshedSummary;
+    } catch {
+      return null;
+    }
   }
 
   private async createLobbyId(): Promise<string> {
@@ -265,6 +332,10 @@ export class DraftLobby {
       const lobby = await this.requireLobby();
       const sessionId = url.searchParams.get("sessionId") ?? "";
       return json(this.toPublicState(lobby, sessionId));
+    }
+
+    if (url.pathname === "/registry-record" && request.method === "GET") {
+      return this.registryRecord();
     }
 
     if (url.pathname === "/results" && request.method === "GET") {
@@ -399,6 +470,16 @@ export class DraftLobby {
     return json({ lobbyId: lobby.id, sessionId, state: this.toPublicState(lobby, sessionId) }, 201);
   }
 
+  private async registryRecord(): Promise<Response> {
+    const lobby = await this.loadLobby();
+
+    if (!lobby || lobby.status === "closed") {
+      return json({ error: "Not found" }, 404);
+    }
+
+    return json(toRegistryRecord(this.toPublicState(lobby, "")));
+  }
+
   private async join(request: Request): Promise<Response> {
     const lobby = await this.requireLobby();
     const body = await readJson<JoinLobbyRequest>(request);
@@ -418,6 +499,18 @@ export class DraftLobby {
 
     if (lobby.playerOrder.length >= 2) {
       return json({ error: "Лобби уже заполнено." }, 409);
+    }
+
+    if (
+      Object.values(lobby.participants).some(
+        (participant) => normalizeNameForLookup(participant.name) === normalizeNameForLookup(playerName)
+      )
+    ) {
+      return json({ error: `Имя "${playerName}" уже используется в этом лобби.` }, 409);
+    }
+
+    if (await this.isNameUsedInOtherLobby(playerName, lobby.id)) {
+      return json({ error: `Имя "${playerName}" уже используется в другом лобби.` }, 409);
     }
 
     const now = Date.now();
@@ -857,6 +950,22 @@ export class DraftLobby {
     return participantId ? lobby.participants[participantId] ?? null : null;
   }
 
+  private async isNameUsedInOtherLobby(name: string, lobbyId: string): Promise<boolean> {
+    const registry = this.env.LOBBY_REGISTRY.get(this.env.LOBBY_REGISTRY.idFromName("global"));
+    const response = await registry.fetch("https://registry/name-check", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ name, excludeLobbyId: lobbyId })
+    });
+
+    if (!response.ok) {
+      throw new Error("Не удалось проверить имя игрока.");
+    }
+
+    const payload = (await response.json()) as { used: boolean };
+    return Boolean(payload.used);
+  }
+
   private hasActiveSocketForParticipant(lobby: InternalLobby, participantId: string): boolean {
     for (const sessionId of this.sockets.values()) {
       if (lobby.sessionIndex[sessionId] === participantId) {
@@ -966,7 +1075,7 @@ export class DraftLobby {
       await registry.fetch("https://registry/upsert", {
         method: "POST",
         headers: { "content-type": "application/json" },
-        body: JSON.stringify(toSummary(this.toPublicState(this.lobby, "")))
+        body: JSON.stringify(toRegistryRecord(this.toPublicState(this.lobby, "")))
       });
     } catch {
       // Registry sync is best-effort; the lobby itself remains authoritative.
@@ -1043,6 +1152,22 @@ function toSummary(state: PublicLobbyState): LobbySummary {
   };
 }
 
+function toRegistryRecord(state: PublicLobbyState): RegistryLobbyRecord {
+  return {
+    ...toSummary(state),
+    participantNames: state.participants.map((participant) => participant.name)
+  };
+}
+
+function toPublicSummary(record: RegistryLobbyRecord): LobbySummary {
+  const { participantNames: _participantNames, ...summary } = record;
+  return summary;
+}
+
+function getRegistryParticipantNames(record: RegistryLobbyRecord): string[] {
+  return record.participantNames?.length ? record.participantNames : [record.hostName];
+}
+
 function getSummaryAutoCloseAt(summary: LobbySummary): number {
   return Number.isFinite(summary.autoCloseAt)
     ? summary.autoCloseAt
@@ -1084,6 +1209,10 @@ function cleanName(value: unknown): string {
   }
 
   return value.trim().replace(/\s+/g, " ").slice(0, 24);
+}
+
+function normalizeNameForLookup(value: unknown): string {
+  return cleanName(value).toLowerCase();
 }
 
 function randomLobbyId(): string {
