@@ -17,7 +17,14 @@ import {
   X
 } from "lucide-react";
 import { createLobby, fetchLobbies, joinLobby } from "./api";
-import { clearStoredSession, getStoredSession, storeSession } from "./session";
+import {
+  cleanUserName,
+  clearStoredSession,
+  getStoredSession,
+  getStoredUserName,
+  storeSession,
+  storeUserName
+} from "./session";
 import { DiceCanvas } from "./DiceCanvas";
 import { CLASS_BY_ID, CLASS_DEFINITIONS, CLASS_IDS, type ClassId } from "../shared/classes";
 import {
@@ -43,6 +50,8 @@ const DEFAULT_COUNTS = Object.fromEntries(CLASS_IDS.map((classId) => [classId, 1
 
 export function App() {
   const [activeLobbyId, setActiveLobbyId] = useState(() => getLobbyIdFromUrl());
+  const [userName, setUserName] = useState(() => getStoredUserName());
+  const [editingUserName, setEditingUserName] = useState(false);
 
   useEffect(() => {
     const onPopState = () => setActiveLobbyId(getLobbyIdFromUrl());
@@ -61,14 +70,120 @@ export function App() {
     setActiveLobbyId(null);
   }, []);
 
-  return activeLobbyId ? (
-    <LobbyRoom lobbyId={activeLobbyId} onLeave={closeLobby} />
-  ) : (
-    <Dashboard onOpenLobby={openLobby} />
+  const saveUserName = useCallback((nextName: string) => {
+    const storedName = storeUserName(nextName);
+    setUserName(storedName || null);
+    setEditingUserName(false);
+  }, []);
+
+  if (!userName) {
+    return <UserNameDialog onSave={saveUserName} />;
+  }
+
+  return (
+    <>
+      {activeLobbyId ? (
+        <LobbyRoom
+          lobbyId={activeLobbyId}
+          userName={userName}
+          onEditUserName={() => setEditingUserName(true)}
+          onLeave={closeLobby}
+        />
+      ) : (
+        <Dashboard
+          userName={userName}
+          onEditUserName={() => setEditingUserName(true)}
+          onOpenLobby={openLobby}
+        />
+      )}
+
+      {editingUserName && (
+        <UserNameDialog
+          initialName={userName}
+          onCancel={() => setEditingUserName(false)}
+          onSave={saveUserName}
+        />
+      )}
+    </>
   );
 }
 
-function Dashboard({ onOpenLobby }: { onOpenLobby: (lobbyId: string) => void }) {
+function UserNameDialog({
+  initialName = "",
+  onCancel,
+  onSave
+}: {
+  initialName?: string;
+  onCancel?: () => void;
+  onSave: (name: string) => void;
+}) {
+  const [name, setName] = useState(initialName);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = (event: FormEvent) => {
+    event.preventDefault();
+    const cleaned = cleanUserName(name);
+
+    if (!cleaned) {
+      setError("Укажи имя.");
+      return;
+    }
+
+    onSave(cleaned);
+  };
+
+  return (
+    <div
+      className="modal-backdrop identity-backdrop"
+      role="dialog"
+      aria-modal="true"
+      aria-label="Имя пользователя"
+      onMouseDown={onCancel}
+    >
+      <section className="panel identity-panel" onMouseDown={(event) => event.stopPropagation()}>
+        {onCancel && (
+          <button className="icon-button modal-close" onClick={onCancel} title="Закрыть">
+            <X size={18} />
+          </button>
+        )}
+        <div className="panel-heading">
+          <div>
+            <p className="eyebrow">Игрок</p>
+            <h2>Твоё имя</h2>
+          </div>
+          <User size={24} />
+        </div>
+        <form className="form-stack" onSubmit={submit}>
+          <label>
+            Имя
+            <input
+              autoFocus
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              maxLength={24}
+              placeholder="Player"
+            />
+          </label>
+          {error && <div className="notice is-error">{error}</div>}
+          <button className="primary-button">
+            <User size={18} />
+            Сохранить имя
+          </button>
+        </form>
+      </section>
+    </div>
+  );
+}
+
+function Dashboard({
+  userName,
+  onEditUserName,
+  onOpenLobby
+}: {
+  userName: string;
+  onEditUserName: () => void;
+  onOpenLobby: (lobbyId: string) => void;
+}) {
   const [createOpen, setCreateOpen] = useState(false);
 
   const handleCreated = useCallback(
@@ -102,6 +217,7 @@ function Dashboard({ onOpenLobby }: { onOpenLobby: (lobbyId: string) => void }) 
           <h1>Draft System</h1>
         </div>
         <div className="topbar-actions">
+          <UserBadge userName={userName} onEdit={onEditUserName} />
           <button className="primary-button create-toggle" onClick={() => setCreateOpen(true)}>
             <Plus size={18} />
             Создать лобби
@@ -128,7 +244,7 @@ function Dashboard({ onOpenLobby }: { onOpenLobby: (lobbyId: string) => void }) 
             <button className="icon-button modal-close" onClick={() => setCreateOpen(false)} title="Закрыть">
               <X size={18} />
             </button>
-            <CreateLobbyPanel onCreated={handleCreated} />
+            <CreateLobbyPanel userName={userName} onCreated={handleCreated} />
           </div>
         </div>
       )}
@@ -136,9 +252,24 @@ function Dashboard({ onOpenLobby }: { onOpenLobby: (lobbyId: string) => void }) 
   );
 }
 
-function CreateLobbyPanel({ onCreated }: { onCreated: (lobbyId: string) => void }) {
+function UserBadge({ userName, onEdit }: { userName: string; onEdit: () => void }) {
+  return (
+    <button className="user-badge" onClick={onEdit} title="Изменить имя">
+      <User size={16} />
+      <span>Ты</span>
+      <strong>{userName}</strong>
+    </button>
+  );
+}
+
+function CreateLobbyPanel({
+  userName,
+  onCreated
+}: {
+  userName: string;
+  onCreated: (lobbyId: string) => void;
+}) {
   const [creatorRole, setCreatorRole] = useState<CreatorRole>("player");
-  const [creatorName, setCreatorName] = useState("");
   const [password, setPassword] = useState("");
   const [rounds, setRounds] = useState(5);
   const [mirrorDraft, setMirrorDraft] = useState(false);
@@ -156,11 +287,6 @@ function CreateLobbyPanel({ onCreated }: { onCreated: (lobbyId: string) => void 
     event.preventDefault();
     setError(null);
 
-    if (!creatorName.trim()) {
-      setError("Укажи имя.");
-      return;
-    }
-
     if (!validation.ok) {
       setError(validation.blockers[0]);
       return;
@@ -169,7 +295,7 @@ function CreateLobbyPanel({ onCreated }: { onCreated: (lobbyId: string) => void 
     setSubmitting(true);
     try {
       const response = await createLobby({
-        creatorName,
+        creatorName: userName,
         creatorRole,
         password: password.trim() || undefined,
         rounds,
@@ -219,15 +345,10 @@ function CreateLobbyPanel({ onCreated }: { onCreated: (lobbyId: string) => void 
         </div>
 
         <div className="two-fields">
-          <label>
-            Имя
-            <input
-              value={creatorName}
-              onChange={(event) => setCreatorName(event.target.value)}
-              placeholder={creatorRole === "manager" ? "Менеджер" : "Player 1"}
-              maxLength={24}
-            />
-          </label>
+          <div className="identity-field">
+            <span>{creatorRole === "manager" ? "Менеджер" : "Игрок"}</span>
+            <strong>{userName}</strong>
+          </div>
           <label>
             Пароль
             <input
@@ -400,7 +521,17 @@ function LobbyBrowser({ onOpenLobby }: { onOpenLobby: (lobbyId: string) => void 
   );
 }
 
-function LobbyRoom({ lobbyId, onLeave }: { lobbyId: string; onLeave: () => void }) {
+function LobbyRoom({
+  lobbyId,
+  userName,
+  onEditUserName,
+  onLeave
+}: {
+  lobbyId: string;
+  userName: string;
+  onEditUserName: () => void;
+  onLeave: () => void;
+}) {
   const [sessionId, setSessionId] = useState(() => getStoredSession(lobbyId));
 
   const handleJoined = (nextSessionId: string) => {
@@ -416,8 +547,13 @@ function LobbyRoom({ lobbyId, onLeave }: { lobbyId: string; onLeave: () => void 
   if (!sessionId) {
     return (
       <main className="shell room-shell">
-        <RoomHeader lobbyId={lobbyId} onLeave={onLeave} />
-        <JoinPanel lobbyId={lobbyId} onJoined={handleJoined} />
+        <RoomHeader
+          lobbyId={lobbyId}
+          userName={userName}
+          onEditUserName={onEditUserName}
+          onLeave={onLeave}
+        />
+        <JoinPanel lobbyId={lobbyId} userName={userName} onJoined={handleJoined} />
       </main>
     );
   }
@@ -426,6 +562,8 @@ function LobbyRoom({ lobbyId, onLeave }: { lobbyId: string; onLeave: () => void 
     <ConnectedLobbyRoom
       lobbyId={lobbyId}
       sessionId={sessionId}
+      userName={userName}
+      onEditUserName={onEditUserName}
       onLeave={onLeave}
       onResetSession={resetSession}
     />
@@ -435,19 +573,31 @@ function LobbyRoom({ lobbyId, onLeave }: { lobbyId: string; onLeave: () => void 
 function ConnectedLobbyRoom({
   lobbyId,
   sessionId,
+  userName,
+  onEditUserName,
   onLeave,
   onResetSession
 }: {
   lobbyId: string;
   sessionId: string;
+  userName: string;
+  onEditUserName: () => void;
   onLeave: () => void;
   onResetSession: () => void;
 }) {
   const { state, send, connected, error } = useLobbySocket(lobbyId, sessionId);
+  const viewerName =
+    state?.participants.find((participant) => participant.id === state.viewerParticipantId)?.name ?? userName;
 
   return (
     <main className="shell room-shell">
-      <RoomHeader lobbyId={lobbyId} onLeave={onLeave} connected={connected} />
+      <RoomHeader
+        lobbyId={lobbyId}
+        userName={viewerName}
+        onEditUserName={onEditUserName}
+        onLeave={onLeave}
+        connected={connected}
+      />
 
       {error && (
         <div className="notice is-error room-notice">
@@ -469,10 +619,14 @@ function ConnectedLobbyRoom({
 
 function RoomHeader({
   lobbyId,
+  userName,
+  onEditUserName,
   onLeave,
   connected
 }: {
   lobbyId: string;
+  userName: string;
+  onEditUserName: () => void;
   onLeave: () => void;
   connected?: boolean;
 }) {
@@ -492,6 +646,7 @@ function RoomHeader({
       <button className="icon-button" onClick={() => void copyLink()} title="Скопировать ссылку">
         <Clipboard size={18} />
       </button>
+      <UserBadge userName={userName} onEdit={onEditUserName} />
       {connected !== undefined && (
         <span className={`connection-dot ${connected ? "is-online" : ""}`}>
           {connected ? "online" : "offline"}
@@ -503,12 +658,13 @@ function RoomHeader({
 
 function JoinPanel({
   lobbyId,
+  userName,
   onJoined
 }: {
   lobbyId: string;
+  userName: string;
   onJoined: (sessionId: string) => void;
 }) {
-  const [playerName, setPlayerName] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -517,15 +673,10 @@ function JoinPanel({
     event.preventDefault();
     setError(null);
 
-    if (!playerName.trim()) {
-      setError("Укажи имя игрока.");
-      return;
-    }
-
     setSubmitting(true);
     try {
       const response = await joinLobby(lobbyId, {
-        playerName,
+        playerName: userName,
         password: password.trim() || undefined
       });
       onJoined(response.sessionId);
@@ -547,15 +698,10 @@ function JoinPanel({
       </div>
 
       <form onSubmit={submit} className="form-stack">
-        <label>
-          Имя игрока
-          <input
-            value={playerName}
-            onChange={(event) => setPlayerName(event.target.value)}
-            maxLength={24}
-            placeholder="Player"
-          />
-        </label>
+        <div className="identity-field">
+          <span>Игрок</span>
+          <strong>{userName}</strong>
+        </div>
         <label>
           Пароль
           <input
