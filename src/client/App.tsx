@@ -6,6 +6,7 @@ import {
   Dice6,
   Lock,
   Play,
+  Plus,
   RefreshCw,
   Search,
   ShieldCheck,
@@ -68,22 +69,69 @@ export function App() {
 }
 
 function Dashboard({ onOpenLobby }: { onOpenLobby: (lobbyId: string) => void }) {
+  const [createOpen, setCreateOpen] = useState(false);
+
+  const handleCreated = useCallback(
+    (lobbyId: string) => {
+      setCreateOpen(false);
+      onOpenLobby(lobbyId);
+    },
+    [onOpenLobby]
+  );
+
+  useEffect(() => {
+    if (!createOpen) {
+      return;
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setCreateOpen(false);
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [createOpen]);
+
   return (
-    <main className="shell">
+    <main className="shell dashboard-shell">
       <header className="topbar">
         <div>
           <p className="eyebrow">Mewgenics</p>
           <h1>Draft System</h1>
         </div>
-        <div className="brand-mark">
-          <Swords size={28} />
+        <div className="topbar-actions">
+          <button className="primary-button create-toggle" onClick={() => setCreateOpen(true)}>
+            <Plus size={18} />
+            Создать лобби
+          </button>
+          <div className="brand-mark">
+            <Swords size={28} />
+          </div>
         </div>
       </header>
 
-      <div className="dashboard-grid">
-        <CreateLobbyPanel onCreated={onOpenLobby} />
+      <div className="dashboard-column">
         <LobbyBrowser onOpenLobby={onOpenLobby} />
       </div>
+
+      {createOpen && (
+        <div
+          className="modal-backdrop"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Создание лобби"
+          onMouseDown={() => setCreateOpen(false)}
+        >
+          <div className="create-dialog" onMouseDown={(event) => event.stopPropagation()}>
+            <button className="icon-button modal-close" onClick={() => setCreateOpen(false)} title="Закрыть">
+              <X size={18} />
+            </button>
+            <CreateLobbyPanel onCreated={handleCreated} />
+          </div>
+        </div>
+      )}
     </main>
   );
 }

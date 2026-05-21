@@ -96,6 +96,17 @@ img {
   color: var(--paper-strong);
 }
 
+.topbar-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+.create-toggle {
+  padding: 0 16px;
+}
+
 .icon-button {
   cursor: pointer;
   transition:
@@ -108,11 +119,22 @@ img {
   background: rgba(255, 243, 218, 0.14);
 }
 
-.dashboard-grid {
-  display: grid;
-  grid-template-columns: minmax(0, 1.45fr) minmax(360px, 0.75fr);
-  gap: 18px;
-  align-items: start;
+.dashboard-shell {
+  width: min(1180px, 100%);
+}
+
+.dashboard-column {
+  width: min(940px, 100%);
+  margin: 0 auto;
+}
+
+.dashboard-column .browser-panel {
+  min-height: calc(100vh - 150px);
+}
+
+.dashboard-column .lobby-list {
+  max-height: calc(100vh - 285px);
+  min-height: 420px;
 }
 
 .panel {
@@ -394,6 +416,38 @@ input:focus {
 
 .danger-button:hover {
   background: rgba(255, 107, 95, 0.24);
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 20;
+  display: grid;
+  place-items: center;
+  overflow: auto;
+  background: rgba(10, 8, 6, 0.74);
+  padding: 24px;
+}
+
+.create-dialog {
+  position: relative;
+  width: min(980px, 100%);
+}
+
+.create-dialog .create-panel {
+  max-height: calc(100vh - 48px);
+  overflow: auto;
+}
+
+.create-dialog .panel-heading {
+  padding-right: 48px;
+}
+
+.modal-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  z-index: 1;
 }
 
 .search-field {
@@ -865,14 +919,9 @@ input:focus {
     padding: 16px;
   }
 
-  .dashboard-grid,
   .room-grid,
   .draft-layout {
     grid-template-columns: 1fr;
-  }
-
-  .browser-panel {
-    order: -1;
   }
 
   .draft-stage {
@@ -883,6 +932,14 @@ input:focus {
 @media (max-width: 720px) {
   .topbar {
     flex-wrap: wrap;
+  }
+
+  .topbar-actions {
+    width: 100%;
+  }
+
+  .create-toggle {
+    flex: 1;
   }
 
   .topbar h1 {
@@ -904,6 +961,20 @@ input:focus {
 
   .lobby-tags {
     justify-content: flex-start;
+  }
+
+  .dashboard-column .browser-panel,
+  .dashboard-column .lobby-list {
+    min-height: auto;
+  }
+
+  .dashboard-column .lobby-list {
+    max-height: none;
+  }
+
+  .modal-backdrop {
+    align-items: start;
+    padding: 12px;
   }
 
   .offer-card {
