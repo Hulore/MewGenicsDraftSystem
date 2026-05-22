@@ -914,6 +914,10 @@ input:focus {
   width: 220px;
   height: 160px;
   overflow: hidden;
+  border-radius: 8px;
+  background:
+    radial-gradient(circle at 50% 86%, rgba(255, 243, 218, 0.09), transparent 45%),
+    linear-gradient(180deg, rgba(255, 243, 218, 0.04), transparent 70%);
 }
 
 .dice-stage canvas {
@@ -921,6 +925,18 @@ input:focus {
   inset: 0;
   width: 220px;
   height: 160px;
+}
+
+.dice-stage.is-active::after,
+.dice-stage.is-rolling::after {
+  content: "";
+  position: absolute;
+  left: 28px;
+  right: 28px;
+  bottom: 12px;
+  height: 2px;
+  border-radius: 999px;
+  background: rgba(255, 243, 218, 0.12);
 }
 
 .dice-face {
@@ -941,9 +957,27 @@ input:focus {
   opacity: 0.55;
 }
 
+.dice-face.is-hidden {
+  opacity: 0;
+}
+
+.dice-stage.is-active .dice-face {
+  animation: die-ready 960ms ease-in-out infinite;
+}
+
 .dice-face.is-settled {
   opacity: 1;
   animation: die-settle 260ms ease both;
+}
+
+@keyframes die-ready {
+  0%,
+  100% {
+    transform: translate(-50%, -50%) rotate(-4deg) scale(1);
+  }
+  50% {
+    transform: translate(-50%, -54%) rotate(4deg) scale(1.04);
+  }
 }
 
 @keyframes die-settle {

@@ -866,19 +866,95 @@ function RollStage({
   send: (message: ClientMessage) => void;
 }) {
   const roll = state.roll;
+  const [settledDice, setSettledDice] = useState<Set<string>>(() => new Set());
+  const handleDiceSettled = useCallback((token: string) => {
+    setSettledDice((current) => {
+      if (current.has(token)) {
+        return current;
+      }
+
+      const next = new Set(current);
+      next.add(token);
+      return next;
+    });
+  }, []);
+
   if (!roll) {
     return <div className="panel loading-panel">Подготовка броска...</div>;
   }
 
+  const latestAttempt = roll.history[roll.history.length - 1];
+  const hasCurrentRolls = Object.keys(roll.currentRolls).length > 0;
+  const latestTieAttempt =
+    latestAttempt?.tied && latestAttempt.attempt === roll.attempt - 1 && !hasCurrentRolls
+      ? latestAttempt
+      : null;
+  const getRollView = (player: Participant) => {
+    const currentValue = roll.currentRolls[player.id];
+    if (currentValue !== undefined) {
+      return {
+        value: currentValue,
+        token: getDiceToken(roll.attempt, player.id, currentValue)
+      };
+    }
+
+    if (latestTieAttempt) {
+      const tieValue = latestTieAttempt.rolls[player.id];
+      if (tieValue === undefined) {
+        return {
+          value: null,
+          token: getDiceToken(roll.attempt, player.id, null)
+        };
+      }
+
+      return {
+        value: tieValue,
+        token: getDiceToken(latestTieAttempt.attempt, player.id, tieValue)
+      };
+    }
+
+    return {
+      value: null,
+      token: getDiceToken(roll.attempt, player.id, null)
+    };
+  };
+  const currentRollsComplete = state.players.every(
+    (player) => roll.currentRolls[player.id] !== undefined
+  );
+  const currentRollsSettled =
+    currentRollsComplete &&
+    state.players.every((player) =>
+      settledDice.has(getDiceToken(roll.attempt, player.id, roll.currentRolls[player.id]))
+    );
+  const tieRevealPending = Boolean(
+    latestTieAttempt &&
+      state.players.some(
+        (player) =>
+          !settledDice.has(getDiceToken(latestTieAttempt.attempt, player.id, latestTieAttempt.rolls[player.id]))
+      )
+  );
   const viewerRoll = state.viewerParticipantId
     ? roll.currentRolls[state.viewerParticipantId]
     : undefined;
   const viewerCanRoll =
     Boolean(state.viewerParticipantId) &&
     state.players.some((player) => player.id === state.viewerParticipantId) &&
-    viewerRoll === undefined;
-  const latestAttempt = roll.history[roll.history.length - 1];
-  const waitingForFinalRound = Boolean(latestAttempt?.winnerId && !latestAttempt.tied);
+    viewerRoll === undefined &&
+    !tieRevealPending;
+  const waitingForFinalRound = Boolean(
+    latestAttempt?.winnerId && !latestAttempt.tied && currentRollsSettled
+  );
+  const visibleHistory = roll.history.filter((attempt) => {
+    if (attempt !== latestAttempt) {
+      return true;
+    }
+
+    if (attempt.tied) {
+      return !tieRevealPending;
+    }
+
+    return currentRollsSettled;
+  });
 
   return (
     <div className="roll-layout">
@@ -893,16 +969,24 @@ function RollStage({
 
         <div className="dice-grid">
           {state.players.map((player) => {
-            const value = roll.currentRolls[player.id] ?? null;
+            const rollView = getRollView(player);
+            const isSettled = rollView.value !== null && settledDice.has(rollView.token);
             return (
               <div className="dice-player" key={player.id}>
                 <strong>{player.name}</strong>
                 <DiceCanvas
-                  value={value}
-                  token={`${roll.attempt}-${player.id}-${value ?? "pending"}`}
-                  active={value === null}
+                  value={rollView.value}
+                  token={rollView.token}
+                  active={rollView.value === null}
+                  onSettled={handleDiceSettled}
                 />
-                <span>{value === null ? "ожидает" : `выпало ${value}`}</span>
+                <span>
+                  {rollView.value === null
+                    ? "ожидает"
+                    : isSettled
+                      ? `выпало ${rollView.value}`
+                      : "катится..."}
+                </span>
               </div>
             );
           })}
@@ -921,9 +1005,9 @@ function RollStage({
           </div>
         )}
 
-        {roll.history.length > 0 && (
+        {visibleHistory.length > 0 && (
           <div className="roll-history">
-            {roll.history.map((attempt) => (
+            {visibleHistory.map((attempt) => (
               <span key={attempt.attempt}>
                 Попытка {attempt.attempt}:{" "}
                 {attempt.tied
@@ -1107,6 +1191,10 @@ function statusLabel(status: PublicLobbyState["status"] | LobbySummary["status"]
   if (status === "drafting") return "Драфт";
   if (status === "closed") return "Закрыто";
   return "Итог";
+}
+
+function getDiceToken(attempt: number, playerId: string, value: number | null | undefined): string {
+  return `${attempt}-${playerId}-${value ?? "pending"}`;
 }
 
 function getLobbyIdFromUrl(): string | null {
