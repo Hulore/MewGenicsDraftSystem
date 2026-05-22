@@ -142,7 +142,11 @@ function UserNameDialog({
     >
       <section className="panel identity-panel" onMouseDown={(event) => event.stopPropagation()}>
         {onCancel && (
-          <button className="icon-button modal-close" onClick={onCancel} title="Закрыть">
+          <button
+            className="icon-button modal-close identity-close"
+            onClick={onCancel}
+            title="Закрыть"
+          >
             <X size={18} />
           </button>
         )}
@@ -256,7 +260,6 @@ function UserBadge({ userName, onEdit }: { userName: string; onEdit: () => void 
   return (
     <button className="user-badge" onClick={onEdit} title="Изменить имя">
       <User size={16} />
-      <span>Ты</span>
       <strong>{userName}</strong>
     </button>
   );
