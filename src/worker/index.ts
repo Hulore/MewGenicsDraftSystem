@@ -68,6 +68,7 @@ const PLAYER_RESULT_PREFIX = "player-result:";
 const ROLL_REVEAL_DELAY_MS = 2200;
 const LOBBY_IDLE_AUTO_CLOSE_MS = 15 * 60 * 1000;
 const LOBBY_ID_PATTERN = /^[A-Z0-9]{6}$/;
+const LOBBY_SESSION_PATTERN = /^[a-f0-9]{32}$/;
 const LOBBY_STATUSES = new Set<LobbyStatus>(["waiting", "rolling", "drafting", "complete", "closed"]);
 
 export default {
@@ -493,7 +494,6 @@ export class LobbyRegistry {
 
 export class DraftLobby {
   private lobby: InternalLobby | null = null;
-  private readonly sockets = new Map<WebSocket, string>();
 
   constructor(
     private readonly state: DurableObjectState,
@@ -783,8 +783,8 @@ export class DraftLobby {
     const pair = new WebSocketPair();
     const [client, server] = Object.values(pair) as [WebSocket, WebSocket];
 
-    server.accept();
-    this.sockets.set(server, sessionId);
+    this.state.acceptWebSocket(server, [sessionId, `participant:${participant.id}`]);
+    server.serializeAttachment({ sessionId });
 
     participant.connected = true;
     participant.lastSeenAt = Date.now();
@@ -792,24 +792,31 @@ export class DraftLobby {
     await this.persist();
     await this.syncSummary();
 
-    server.addEventListener("message", (event) => {
-      void this.handleSocketMessage(server, event.data);
-    });
-    server.addEventListener("close", () => {
-      void this.handleSocketClose(server);
-    });
-    server.addEventListener("error", () => {
-      void this.handleSocketClose(server);
-    });
-
     this.send(server, { type: "state", state: this.toPublicState(lobby, sessionId) });
     this.broadcast(lobby);
 
     return new Response(null, { status: 101, webSocket: client });
   }
 
+  async webSocketMessage(socket: WebSocket, data: string | ArrayBuffer): Promise<void> {
+    await this.handleSocketMessage(socket, data);
+  }
+
+  async webSocketClose(socket: WebSocket, code: number, reason: string, _wasClean: boolean): Promise<void> {
+    await this.handleSocketClose(socket);
+    try {
+      socket.close(code, reason);
+    } catch {
+      // The socket may already be closed by the time the hibernation close handler runs.
+    }
+  }
+
+  async webSocketError(socket: WebSocket): Promise<void> {
+    await this.handleSocketClose(socket);
+  }
+
   private async handleSocketMessage(socket: WebSocket, data: unknown): Promise<void> {
-    const sessionId = this.sockets.get(socket);
+    const sessionId = this.getSocketSessionId(socket);
     if (!sessionId) {
       return;
     }
@@ -850,9 +857,7 @@ export class DraftLobby {
   }
 
   private async handleSocketClose(socket: WebSocket): Promise<void> {
-    const sessionId = this.sockets.get(socket);
-    this.sockets.delete(socket);
-
+    const sessionId = this.getSocketSessionId(socket);
     if (!sessionId) {
       return;
     }
@@ -867,7 +872,7 @@ export class DraftLobby {
       return;
     }
 
-    if (!this.hasActiveSocketForParticipant(lobby, participant.id)) {
+    if (!this.hasActiveSocketForParticipant(lobby, participant.id, socket)) {
       participant.connected = false;
       participant.lastSeenAt = Date.now();
       this.touchLobby(lobby, participant.lastSeenAt);
@@ -1159,7 +1164,13 @@ export class DraftLobby {
   }
 
   private broadcast(lobby: InternalLobby): void {
-    for (const [socket, sessionId] of this.sockets) {
+    for (const socket of this.state.getWebSockets()) {
+      const sessionId = this.getSocketSessionId(socket);
+      if (!sessionId) {
+        socket.close(1008, "Missing session");
+        continue;
+      }
+
       this.send(socket, { type: "state", state: this.toPublicState(lobby, sessionId) });
     }
   }
@@ -1168,7 +1179,7 @@ export class DraftLobby {
     try {
       socket.send(JSON.stringify(message));
     } catch {
-      this.sockets.delete(socket);
+      socket.close(1011, "Send failed");
     }
   }
 
@@ -1193,9 +1204,27 @@ export class DraftLobby {
     return Boolean(payload.used);
   }
 
-  private hasActiveSocketForParticipant(lobby: InternalLobby, participantId: string): boolean {
-    for (const sessionId of this.sockets.values()) {
-      if (lobby.sessionIndex[sessionId] === participantId) {
+  private getSocketSessionId(socket: WebSocket): string | null {
+    const attachment = socket.deserializeAttachment();
+    if (isRecord(attachment) && typeof attachment.sessionId === "string") {
+      return attachment.sessionId;
+    }
+
+    return this.state.getTags(socket).find((tag) => LOBBY_SESSION_PATTERN.test(tag)) ?? null;
+  }
+
+  private hasActiveSocketForParticipant(
+    lobby: InternalLobby,
+    participantId: string,
+    ignoredSocket?: WebSocket
+  ): boolean {
+    for (const socket of this.state.getWebSockets()) {
+      if (socket === ignoredSocket || socket.readyState !== WebSocket.OPEN) {
+        continue;
+      }
+
+      const sessionId = this.getSocketSessionId(socket);
+      if (sessionId && lobby.sessionIndex[sessionId] === participantId) {
         return true;
       }
     }
