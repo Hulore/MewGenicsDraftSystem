@@ -67,6 +67,8 @@ const REGISTRY_PREFIX = "lobby:";
 const PLAYER_RESULT_PREFIX = "player-result:";
 const ROLL_REVEAL_DELAY_MS = 2200;
 const LOBBY_IDLE_AUTO_CLOSE_MS = 15 * 60 * 1000;
+const LOBBY_ID_PATTERN = /^[A-Z0-9]{6}$/;
+const LOBBY_STATUSES = new Set<LobbyStatus>(["waiting", "rolling", "drafting", "complete", "closed"]);
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -195,7 +197,11 @@ export class LobbyRegistry {
     }
 
     if (url.pathname === "/upsert" && request.method === "POST") {
-      const summary = await readJson<RegistryLobbyRecord>(request);
+      const summary = normalizeRegistryRecord(await readJson<RegistryLobbyRecord>(request));
+      if (!summary) {
+        return json({ error: "Invalid lobby record." }, 400);
+      }
+
       await this.state.storage.put(`${REGISTRY_PREFIX}${summary.id}`, summary);
       return json({ ok: true });
     }
@@ -219,7 +225,11 @@ export class LobbyRegistry {
 
     if (url.pathname === "/remove" && request.method === "POST") {
       const body = await readJson<{ id: string }>(request);
-      await this.state.storage.delete(`${REGISTRY_PREFIX}${body.id}`);
+      const lobbyId = normalizeLobbyId(body.id);
+      if (lobbyId) {
+        await this.state.storage.delete(`${REGISTRY_PREFIX}${lobbyId}`);
+      }
+
       return json({ ok: true });
     }
 
@@ -230,8 +240,8 @@ export class LobbyRegistry {
     }
 
     if (url.pathname === "/admin-close-all" && request.method === "POST") {
-      const entries = await this.state.storage.list<LobbySummary>({ prefix: REGISTRY_PREFIX });
-      const ids = [...entries.values()].map((lobby) => lobby.id);
+      const records = await this.listActiveLobbyRecords();
+      const ids = records.map((lobby) => lobby.id);
       const closed = [];
 
       for (const id of ids) {
@@ -328,15 +338,25 @@ export class LobbyRegistry {
   }
 
   private async closeLobbyById(id: string): Promise<string[]> {
-    const summary = await this.state.storage.get<RegistryLobbyRecord>(`${REGISTRY_PREFIX}${id}`);
+    const lobbyId = normalizeLobbyId(id);
+    if (!lobbyId) {
+      return [];
+    }
+
+    const storageKey = `${REGISTRY_PREFIX}${lobbyId}`;
+    const summary = await this.state.storage.get<RegistryLobbyRecord>(storageKey);
     if (!summary) {
       return [];
     }
 
-    const lobby = this.env.DRAFT_LOBBY.get(this.env.DRAFT_LOBBY.idFromName(id));
-    await lobby.fetch("https://lobby/admin-close", { method: "POST" });
-    await this.state.storage.delete(`${REGISTRY_PREFIX}${id}`);
-    return [id];
+    try {
+      const lobby = this.env.DRAFT_LOBBY.get(this.env.DRAFT_LOBBY.idFromName(lobbyId));
+      await lobby.fetch("https://lobby/admin-close", { method: "POST" });
+    } finally {
+      await this.state.storage.delete(storageKey);
+    }
+
+    return [lobbyId];
   }
 
   private async listVisibleLobbies(): Promise<LobbySummary[]> {
@@ -367,9 +387,21 @@ export class LobbyRegistry {
     const now = Date.now();
     const lobbies: RegistryLobbyRecord[] = [];
 
-    for (let summary of entries.values()) {
+    for (const [storageKey, rawSummary] of entries) {
+      let summary = normalizeRegistryRecord(rawSummary, storageKey);
+      if (!summary) {
+        await this.state.storage.delete(storageKey);
+        continue;
+      }
+
+      const normalizedStorageKey = `${REGISTRY_PREFIX}${summary.id}`;
+      if (storageKey !== normalizedStorageKey) {
+        await this.state.storage.put(normalizedStorageKey, summary);
+        await this.state.storage.delete(storageKey);
+      }
+
       if (summary.status === "closed") {
-        await this.state.storage.delete(`${REGISTRY_PREFIX}${summary.id}`);
+        await this.state.storage.delete(normalizedStorageKey);
         continue;
       }
 
@@ -381,7 +413,7 @@ export class LobbyRegistry {
       if (!summary.participantNames?.length) {
         const refreshedSummary = await this.refreshLobbyRecord(summary);
         if (!refreshedSummary || refreshedSummary.status === "closed") {
-          await this.state.storage.delete(`${REGISTRY_PREFIX}${summary.id}`);
+          await this.state.storage.delete(normalizedStorageKey);
           continue;
         }
 
@@ -403,7 +435,11 @@ export class LobbyRegistry {
         return null;
       }
 
-      const refreshedSummary = (await response.json()) as RegistryLobbyRecord;
+      const refreshedSummary = normalizeRegistryRecord(await response.json());
+      if (!refreshedSummary) {
+        return null;
+      }
+
       await this.state.storage.put(`${REGISTRY_PREFIX}${refreshedSummary.id}`, refreshedSummary);
       return refreshedSummary;
     } catch {
@@ -1344,6 +1380,63 @@ function toRegistryRecord(state: PublicLobbyState): RegistryLobbyRecord {
     ...toSummary(state),
     participantNames: state.participants.map((participant) => participant.name)
   };
+}
+
+function normalizeRegistryRecord(value: unknown, storageKey?: string): RegistryLobbyRecord | null {
+  if (!isRecord(value)) {
+    return null;
+  }
+
+  const id = normalizeLobbyId(value.id) ?? normalizeLobbyId(storageKey?.slice(REGISTRY_PREFIX.length));
+  if (!id) {
+    return null;
+  }
+
+  const participantNames = Array.isArray(value.participantNames)
+    ? value.participantNames.map(cleanName).filter(Boolean)
+    : [];
+  const createdAt = finiteNumber(value.createdAt, Date.now());
+  const updatedAt = finiteNumber(value.updatedAt, createdAt);
+  const autoCloseAt = finiteNumber(value.autoCloseAt, updatedAt + LOBBY_IDLE_AUTO_CLOSE_MS);
+  const status: LobbyStatus = isLobbyStatus(value.status) ? value.status : "waiting";
+  const creatorRole: CreatorRole = value.creatorRole === "manager" ? "manager" : "player";
+
+  return {
+    id,
+    hostName: cleanName(value.hostName) || participantNames[0] || "Unknown",
+    creatorRole,
+    hasPassword: value.hasPassword === true,
+    status,
+    playerCount: Math.max(0, Math.floor(finiteNumber(value.playerCount, 0))),
+    requiredPlayers: Math.max(2, Math.floor(finiteNumber(value.requiredPlayers, 2))),
+    rounds: Math.max(1, Math.floor(finiteNumber(value.rounds, 1))),
+    mirrorDraft: value.mirrorDraft === true,
+    createdAt,
+    updatedAt,
+    autoCloseAt,
+    participantNames
+  };
+}
+
+function normalizeLobbyId(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+
+  const lobbyId = value.trim().toUpperCase();
+  return LOBBY_ID_PATTERN.test(lobbyId) ? lobbyId : null;
+}
+
+function isLobbyStatus(value: unknown): value is LobbyStatus {
+  return typeof value === "string" && LOBBY_STATUSES.has(value as LobbyStatus);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function finiteNumber(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
 function toPublicSummary(record: RegistryLobbyRecord): LobbySummary {
