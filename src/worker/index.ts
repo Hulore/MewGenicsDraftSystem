@@ -83,6 +83,24 @@ export default {
       return registry.fetch(new Request("https://registry/list", request));
     }
 
+    if (url.pathname === "/api/health" && request.method === "GET") {
+      return json({
+        ok: true,
+        hasRegistryBinding: Boolean(env.LOBBY_REGISTRY),
+        hasLobbyBinding: Boolean(env.DRAFT_LOBBY)
+      });
+    }
+
+    if (url.pathname === "/api/debug/registry-ping" && request.method === "GET") {
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      return registry.fetch("https://registry/ping");
+    }
+
+    if (url.pathname === "/api/debug/registry-storage" && request.method === "GET") {
+      const registry = env.LOBBY_REGISTRY.get(env.LOBBY_REGISTRY.idFromName("global"));
+      return registry.fetch("https://registry/storage-check");
+    }
+
     if (url.pathname === "/api/admin/lobbies/close-all" && request.method === "POST") {
       if (!isAuthorizedAdmin(request, env)) {
         return json({ error: "Not found" }, 404);
@@ -161,6 +179,19 @@ export class LobbyRegistry {
 
     if (url.pathname === "/list" && request.method === "GET") {
       return json({ lobbies: await this.listVisibleLobbies() });
+    }
+
+    if (url.pathname === "/ping" && request.method === "GET") {
+      return json({ ok: true, durableObject: "LobbyRegistry", now: Date.now() });
+    }
+
+    if (url.pathname === "/storage-check" && request.method === "GET") {
+      try {
+        const entries = await this.state.storage.list({ prefix: REGISTRY_PREFIX, limit: 1 });
+        return json({ ok: true, entryCount: entries.size });
+      } catch (error) {
+        return json({ ok: false, error: getErrorMessage(error) }, 500);
+      }
     }
 
     if (url.pathname === "/create" && request.method === "POST") {
@@ -1437,6 +1468,10 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function finiteNumber(value: unknown, fallback: number): number {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+
+function getErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function toPublicSummary(record: RegistryLobbyRecord): LobbySummary {
